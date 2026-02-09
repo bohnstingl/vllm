@@ -257,22 +257,20 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         # Step 2: Gather keys and values from blocks
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
-
-        gathered_keys = self._gather_from_kv_cache(
-            key_cache,
+        
+        # Step 3: Compute block mask for KV cache
+        block_mask = self._gather_block_mask(
+            kv_cache,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
+            attn_metadata.causal_mask,
+            attn_metadata.slot_mapping,
+            attn_metadata.query_start_loc,
             attn_metadata.block_size,
+            query.shape[1],
         )
 
-        gathered_values = self._gather_from_kv_cache(
-            value_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            attn_metadata.block_size,
-        )
-
-        # Step 3: Prepare query tensor
+        # Step 4: Prepare query tensor
         query_per_seq = self._reshape_query_to_sequences(
             query[:num_actual_tokens],
             attn_metadata.query_start_loc,
@@ -282,29 +280,15 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
 
         # Step 4: Compute attention
         attn_output = self._compute_attention(
-            query_per_seq,
-            gathered_keys,
-            gathered_values,
+            query_per_seq.reshape(1, -1, query.shape[1], query.shape[2]),
+            key_cache.reshape(1, -1, key.shape[1], key.shape[2]),
+            value_cache.reshape(1, -1, key.shape[1], key.shape[2]),
             attn_metadata,
-        )
-        
-        # import os
-        # if os.environ["DEBUG"] == "STOP":
-        #     print('I am here')
-
-        # # Step 5: Reshape output back
-        attn_output2 = self._reshape_output_from_sequences(
-            attn_output,
-            attn_metadata.query_start_loc,
-            num_actual_tokens,
+            block_mask=block_mask
         )
 
         # Copy to output tensor
-        output[:num_actual_tokens].copy_(attn_output2)
-
-        import os
-        if "DEBUG" in os.environ and os.environ["DEBUG"] == "STOP":
-            print('I am here')
+        output[:num_actual_tokens].copy_(attn_output)
 
         return output
 
@@ -334,47 +318,62 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
             offset = block_offsets[i].item()
             key_cache[block_idx, offset] = key[i]
             value_cache[block_idx, offset] = value[i]
-
-    def _gather_from_kv_cache(
+            
+    def _gather_block_mask(
         self,
-        cache: torch.Tensor,
+        kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        causal_mask: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
         block_size: int,
+        num_heads: int,
     ) -> torch.Tensor:
         """Gather keys or values from paged KV cache."""
 
         num_seqs = block_table.shape[0]
-        max_seq_len = seq_lens.max().item()
-        num_kv_heads = cache.shape[2]
-        head_size = cache.shape[3]
+        num_blocks, block_size, num_kv_heads, head_size = kv_cache.shape[1:]
+        
+        num_tokens_per_sequence = [query_start_loc[i + 1] - query_start_loc[i] for i in range(len(query_start_loc) - 1)]
+        max_num_tokens_per_sequence = torch.maximum(*num_tokens_per_sequence)
 
         # Initialize output tensor
-        gathered = torch.zeros(
-            num_seqs,
-            max_seq_len,
-            num_kv_heads,
-            head_size,
-            dtype=cache.dtype,
-            device=cache.device,
+        block_mask = torch.ones(
+            num_seqs * max_num_tokens_per_sequence,
+            num_blocks * block_size,
+            dtype=torch.bool,
+            device=kv_cache.device,
         )
 
         # Gather tokens for each sequence
         for seq_idx in range(num_seqs):
-            seq_len = seq_lens[seq_idx].item()
+            seq_remainder = seq_lens[seq_idx] % block_size
+            for bl_ind, bl in enumerate(block_table[seq_idx]):
+                seq_len_curr_block = min(seq_lens[seq_idx] - bl_ind * block_size, block_size)
+                max_bl_ind = ((seq_lens[seq_idx] // block_size) + (1 if seq_lens[seq_idx] % block_size else 0))
+                if bl_ind < max_bl_ind:
+                    block_mask[seq_idx * max_num_tokens_per_sequence : (seq_idx + 1) * max_num_tokens_per_sequence, bl * block_size : bl * block_size + seq_len_curr_block] = 0
+                    
+            if causal_mask is not None:
+                # # real_bl_ind = torch.argwhere(torch.sort(block_table[seq_idx]).values == bl)[0]
+                # real_bl_ind = torch.argwhere(block_table[seq_idx] == bl)[0]
+                # real_inv_bl_ind = max_bl_ind - 1 - real_bl_ind
+                # real_seq_len_curr_block = min(seq_lens[seq_idx] - real_bl_ind * block_size, block_size)
+                # # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block]
+                # # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = torch.flip(~causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block], (0,-1))
+                # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = torch.concat([torch.zeros_like(causal_mask[:, 0:1]), torch.roll(torch.flip(~causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block], (0,-1)), 1, -1)[:, 1:]], 1)
+                last_new_token = slot_mapping[query_start_loc[seq_idx + 1] - 1]
+                for token_nr in range(num_tokens_per_sequence[seq_idx] - 1):
+                    slot_for_write = slot_mapping[query_start_loc[seq_idx] + 1 + token_nr]
+                    block_nr = slot_for_write // block_size
+                    block_idx = slot_for_write % block_size
+                    block_mask[seq_idx * max_num_tokens_per_sequence + token_nr, slot_for_write:last_new_token+1] = 1
 
-            for token_idx in range(seq_len):
-                # Determine which block and offset
-                block_idx_in_table = token_idx // block_size
-                block_offset = token_idx % block_size
+        block_mask = block_mask.unsqueeze(0).unsqueeze(0)
+        block_mask = block_mask.expand(-1, num_heads, -1, -1)
 
-                # Get physical block index
-                physical_block_idx = block_table[seq_idx, block_idx_in_table].item()
-
-                # Gather token
-                gathered[seq_idx, token_idx] = cache[physical_block_idx, block_offset]
-
-        return gathered
+        return block_mask
 
     def _reshape_query_to_sequences(
         self,
@@ -415,6 +414,7 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: PyTorchNativeAttentionMetadata,
+        block_mask: torch.Tensor = None
     ) -> torch.Tensor:
         """Compute attention using PyTorch operations."""
 
@@ -424,74 +424,36 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
             key = key.repeat_interleave(self.num_queries_per_kv, dim=2)
             value = value.repeat_interleave(self.num_queries_per_kv, dim=2)
 
+        # Bq, Bkv = query.size(0), key.size(0)
+        # if not ((Bq == Bkv) or (Bq > 1 and Bkv == 1)):
+        #     raise RuntimeError(f"Bq and Bkv must broadcast. Got Bq={Bq} and Bkv={Bkv}")
+
+        # key = key.expand((Bq, *key.size()[1:]))
+        # value = value.expand((Bq, *value.size()[1:]))
+
         # Transpose for matmul
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        working_precision = torch.float64 if query.dtype == torch.float64 else torch.float32
+
         # Compute Q @ K^T
-        attn_scores = torch.matmul(query, key.transpose(-2, -1))
+        attn_scores = torch.matmul(query.to(working_precision), key.to(working_precision).transpose(-2, -1))
 
         # Scale
-        attn_scores = attn_scores * self.scale
+        attn_scores = (attn_scores * self.scale).to(working_precision)
 
-        # Apply causal mask if needed
-        if attn_metadata.causal_mask is not None:
-            mask = attn_metadata.causal_mask.unsqueeze(0).unsqueeze(0)
-            attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+        if block_mask is not None:
+            attn_scores = attn_scores.masked_fill(block_mask, -float('inf'))
 
         # Softmax
-        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = torch._safe_softmax(attn_scores, dim=-1)
 
         # Compute attention output
-        attn_output = torch.matmul(attn_weights, value)
+        attn_output = torch.matmul(attn_weights.to(query.dtype), value.to(query.dtype))
 
         # Transpose back
-        attn_output = attn_output.transpose(1, 2)
+        attn_output = attn_output.transpose(1, 2).squeeze(0)
 
         return attn_output
-
-    def _reshape_output_from_sequences(
-        self,
-        output_per_seq: torch.Tensor,
-        query_start_loc: torch.Tensor,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        """Reshape output from per-sequence format back to flat tokens."""
-
-        num_seqs = output_per_seq.shape[0]
-        num_heads = output_per_seq.shape[2]
-        head_size = output_per_seq.shape[3]
-        device = output_per_seq.device
-
-        # # Initialize flat output
-        # output_flat = torch.zeros(
-        #     num_tokens,
-        #     num_heads * head_size,
-        #     dtype=output_per_seq.dtype,
-        #     device=device,
-        # )
-        # Initialize flat output
-        output_flat = torch.zeros(
-            num_tokens,
-            num_heads,
-            head_size,
-            dtype=output_per_seq.dtype,
-            device=device,
-        )
-
-        # Extract outputs for each sequence
-        for seq_idx in range(num_seqs):
-            start = query_start_loc[seq_idx].item()
-            end = query_start_loc[seq_idx + 1].item()
-            seq_len = end - start
-
-            # Reshape and copy
-            seq_output = output_per_seq[seq_idx, :seq_len]
-            # seq_output = seq_output.reshape(seq_len, num_heads * head_size)
-            seq_output = seq_output.reshape(seq_len, num_heads, head_size)
-            output_flat[start:end] = seq_output
-
-        return output_flat
-
-# Made with Bob
