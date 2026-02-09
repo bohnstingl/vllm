@@ -206,6 +206,7 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        working_precision = None
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -214,6 +215,11 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         self.num_queries_per_kv = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+
+        if working_precision is not None:
+            self.working_precision = working_precision
+        else:
+            self.working_precision = torch.bfloat16
 
         # Simplified implementation: don't support these features initially
         if alibi_slopes is not None:
@@ -286,6 +292,12 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
             attn_metadata,
             block_mask=block_mask
         )
+        
+        # Step 5: Extract only relevant tokens
+        attn_output = self._extract_relevant_output(
+            attn_output,
+            attn_metadata.query_start_loc,
+        )
 
         # Copy to output tensor
         output[:num_actual_tokens].copy_(attn_output)
@@ -336,7 +348,7 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         num_blocks, block_size, num_kv_heads, head_size = kv_cache.shape[1:]
         
         num_tokens_per_sequence = [query_start_loc[i + 1] - query_start_loc[i] for i in range(len(query_start_loc) - 1)]
-        max_num_tokens_per_sequence = torch.maximum(*num_tokens_per_sequence)
+        max_num_tokens_per_sequence = torch.max(torch.stack(num_tokens_per_sequence))
 
         # Initialize output tensor
         block_mask = torch.ones(
@@ -356,24 +368,28 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
                     block_mask[seq_idx * max_num_tokens_per_sequence : (seq_idx + 1) * max_num_tokens_per_sequence, bl * block_size : bl * block_size + seq_len_curr_block] = 0
                     
             if causal_mask is not None:
-                # # real_bl_ind = torch.argwhere(torch.sort(block_table[seq_idx]).values == bl)[0]
-                # real_bl_ind = torch.argwhere(block_table[seq_idx] == bl)[0]
-                # real_inv_bl_ind = max_bl_ind - 1 - real_bl_ind
-                # real_seq_len_curr_block = min(seq_lens[seq_idx] - real_bl_ind * block_size, block_size)
-                # # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block]
-                # # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = torch.flip(~causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block], (0,-1))
-                # block_mask[seq_idx * num_tokens_per_sequence : (seq_idx + 1) * num_tokens_per_sequence, bl * block_size : bl * block_size + real_seq_len_curr_block] = torch.concat([torch.zeros_like(causal_mask[:, 0:1]), torch.roll(torch.flip(~causal_mask[:, max(real_inv_bl_ind * block_size - seq_remainder, 0) : max(real_inv_bl_ind * block_size - seq_remainder, 0) + real_seq_len_curr_block], (0,-1)), 1, -1)[:, 1:]], 1)
-                last_new_token = slot_mapping[query_start_loc[seq_idx + 1] - 1]
                 for token_nr in range(num_tokens_per_sequence[seq_idx] - 1):
-                    slot_for_write = slot_mapping[query_start_loc[seq_idx] + 1 + token_nr]
-                    block_nr = slot_for_write // block_size
-                    block_idx = slot_for_write % block_size
-                    block_mask[seq_idx * max_num_tokens_per_sequence + token_nr, slot_for_write:last_new_token+1] = 1
+                    slot_for_write = slot_mapping[query_start_loc[seq_idx] + 1 + token_nr:]
+                    block_mask[seq_idx * max_num_tokens_per_sequence + token_nr, slot_for_write] = 1
 
         block_mask = block_mask.unsqueeze(0).unsqueeze(0)
         block_mask = block_mask.expand(-1, num_heads, -1, -1)
 
         return block_mask
+    
+    def _extract_relevant_output(
+        self,
+        attn_output: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ):
+        num_tokens_per_sequence = [query_start_loc[i + 1] - query_start_loc[i] for i in range(len(query_start_loc) - 1)]
+        max_num_tokens_per_sequence = torch.max(torch.stack(num_tokens_per_sequence))
+        
+        token_indices = []
+        for seq_idx, seq_n_tokens in enumerate(num_tokens_per_sequence):
+            token_indices.extend(range(seq_idx * max_num_tokens_per_sequence, seq_idx * max_num_tokens_per_sequence + seq_n_tokens))
+        
+        return attn_output[token_indices]
 
     def _reshape_query_to_sequences(
         self,
@@ -436,13 +452,11 @@ class PyTorchNativeAttentionImpl(AttentionImpl[PyTorchNativeAttentionMetadata]):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
-        working_precision = torch.float64 if query.dtype == torch.float64 else torch.float32
-
         # Compute Q @ K^T
-        attn_scores = torch.matmul(query.to(working_precision), key.to(working_precision).transpose(-2, -1))
+        attn_scores = torch.matmul(query.to(self.working_precision), key.to(self.working_precision).transpose(-2, -1))
 
         # Scale
-        attn_scores = (attn_scores * self.scale).to(working_precision)
+        attn_scores = (attn_scores * self.scale).to(self.working_precision)
 
         if block_mask is not None:
             attn_scores = attn_scores.masked_fill(block_mask, -float('inf'))

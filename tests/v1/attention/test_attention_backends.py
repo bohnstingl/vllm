@@ -9,7 +9,8 @@ import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 import sys
-sys.path.append('/block/boh/vllm/')
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir))
 
 from tests.v1.attention.utils import (
     BatchSpec,
@@ -41,7 +42,7 @@ BACKENDS_TO_TEST = [
     AttentionBackendEnum.TRITON_ATTN,
     AttentionBackendEnum.TREE_ATTN,
     "FLEX_ATTENTION_SLOW",
-    "PYTORCH_NATIVE",
+    AttentionBackendEnum.PYTORCH_NATIVE,
 ]
 
 # Remove flashinfer from the list if it's not available
