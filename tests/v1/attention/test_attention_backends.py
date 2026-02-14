@@ -8,6 +8,10 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, os.pardir))
+
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
@@ -38,6 +42,7 @@ BACKENDS_TO_TEST = [
     AttentionBackendEnum.TRITON_ATTN,
     AttentionBackendEnum.TREE_ATTN,
     "FLEX_ATTENTION_SLOW",
+    AttentionBackendEnum.PYTORCH_NATIVE,
 ]
 
 # Remove flashinfer from the list if it's not available
@@ -737,3 +742,12 @@ def test_sliding_window_encoder_backend_correctness(
         attn_type=AttentionType.ENCODER_ONLY,
         tensor_parallel_size=tensor_parallel_size,
     )
+    
+if __name__ == "__main__":
+    import sys
+    test_function = sys.argv[1]
+    
+    pytest.main([
+        "-q",
+        __file__ + f"::{test_function}",
+    ])
