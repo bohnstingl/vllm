@@ -53,6 +53,8 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from vllm.model_executor import spyre_op
+
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -251,7 +253,7 @@ class GraniteDecoderLayer(nn.Module):
         return hidden_states
 
 
-@support_torch_compile
+# @support_torch_compile
 class GraniteModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

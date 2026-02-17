@@ -183,6 +183,11 @@ class PyTorchNativeAttentionBackend(AttentionBackend):
     def supports_head_size(cls, head_size: int) -> bool:
         # Support any head size
         return True
+    
+    @classmethod
+    def supports_alibi_sqrt(cls, *args, **kwargs) -> bool:
+        # Support any head size
+        return False
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
