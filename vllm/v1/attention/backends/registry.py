@@ -206,6 +206,10 @@ MAMBA_TYPE_TO_BACKEND_MAP = {
 _ATTN_OVERRIDES: dict[AttentionBackendEnum, str] = {}
 _MAMBA_ATTN_OVERRIDES: dict[MambaAttentionBackendEnum, str] = {}
 
+_ATTN_WITH_CPU_SUPPORT: dict[AttentionBackendEnum, str] = [
+    AttentionBackendEnum.CPU_ATTN,
+    AttentionBackendEnum.PYTORCH_NATIVE,
+    ]
 
 def register_backend(
     backend: AttentionBackendEnum | MambaAttentionBackendEnum,

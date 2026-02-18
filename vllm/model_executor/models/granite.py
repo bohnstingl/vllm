@@ -251,7 +251,7 @@ class GraniteDecoderLayer(nn.Module):
         return hidden_states
 
 
-@support_torch_compile
+# @support_torch_compile
 class GraniteModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

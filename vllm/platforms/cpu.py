@@ -17,7 +17,7 @@ import torch
 from vllm import envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import is_quantized_kv_cache
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.registry import AttentionBackendEnum, _ATTN_WITH_CPU_SUPPORT
 
 from .interface import CpuArchEnum, Platform, PlatformEnum
 
@@ -131,13 +131,13 @@ class CpuPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
-        if selected_backend and selected_backend != AttentionBackendEnum.CPU_ATTN:
+        if selected_backend and selected_backend not in _ATTN_WITH_CPU_SUPPORT:
             logger.info("Cannot use %s backend on CPU.", selected_backend)
         if attn_selector_config.use_mla:
             raise NotImplementedError("MLA is not supported on CPU.")
         if attn_selector_config.use_sparse:
             raise NotImplementedError("Sparse Attention is not supported on CPU.")
-        return AttentionBackendEnum.CPU_ATTN.get_path()
+        return selected_backend.get_path() if selected_backend is not None else AttentionBackendEnum.CPU_ATTN.get_path()
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
