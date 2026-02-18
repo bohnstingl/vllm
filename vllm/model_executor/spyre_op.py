@@ -5,10 +5,12 @@ import torch.nn as nn
 
 import torch.utils._pytree as pytree
 
-from vllm.config import get_cached_compilation_config
+from vllm.config import get_cached_compilation_config, get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.utils import maybe_disable_graph_partition
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -22,40 +24,84 @@ def _prepare_inputs_on_spyre(*args):
 
 @RMSNorm.register_oot
 class SpyreRMSNorm(RMSNorm):
-    """OOT version of RMSNorm for IBM's Spyre device"""
+    """OOT version of RMSNorm for IBM's Spyre device
+    
+    This implementation uses a custom op registration to avoid being compiled
+    by torch.compile, similar to how MambaMixer2 handles its operations.
+    The layer is registered in static_forward_context and accessed via
+    no_compile_layers during forward pass.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # # NOTE(woosuk): Here we assume that vLLM was built for only one
-        # # specific backend. Currently, we do not support dynamic dispatching.
-        # compilation_config = get_cached_compilation_config()
+        # Compile the Spyre-specific forward implementation
+        # This compilation is separate from the main model compilation
+        self._fwd_spyre = torch.compile(
+            self._forward_static_spyre,
+            dynamic=False
+        )
         
-        # # NOTE(shen-shanshan): CustomOp object can be enforce enabled, e.g.,
-        # # enable device-specific kernels in ViT models when enabling graph
-        # # mode. By default, it will follow the compilation_config to determine
-        # # whether enable itself.
-        # # This enforce_enable mechanism will be removed after we adding a
-        # # separate compilation_config for multi-modal part.
-        # enabled = self._enforce_enable or self.enabled()
-        # if enabled:
-        #     compilation_config.enabled_custom_ops.update([self.__class__.name])
-        # else:
-        #     compilation_config.disabled_custom_ops.update([self.__class__.name])
-
-        enabled = False
-        # enabled = True
-
-        if not enabled:
-            # # Compile forward_native to avoid eager torch ops if inside
-            # # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)
-            # self._forward = self.maybe_compile(self.forward_native, enable=True)
-            self._fwd_spyre = torch.compile(self._forward_static_spyre,
-                                            dynamic=False)
+        # Register this layer in the static forward context
+        # This allows it to be accessed during the custom op execution
+        compilation_config = get_current_vllm_config().compilation_config
+        # Use a unique prefix for this layer - you may want to pass this as a parameter
+        # For now, we'll use a counter-based approach
+        if not hasattr(SpyreRMSNorm, '_instance_counter'):
+            SpyreRMSNorm._instance_counter = 0
+        self.prefix = f"spyre_rmsnorm_{SpyreRMSNorm._instance_counter}"
+        SpyreRMSNorm._instance_counter += 1
+        
+        if self.prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {self.prefix}")
+        compilation_config.static_forward_context[self.prefix] = self
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward method that uses a custom op to avoid torch.compile.
+        
+        This delegates to the custom op which will call forward_impl
+        outside of the compilation graph.
+        """
+        # Create output tensor
+        output = torch.empty_like(x)
+        
+        # Call the custom op - this will NOT be compiled
+        torch.ops.vllm.spyre_rmsnorm(
+            x,
+            output,
+            self.prefix,
+            residual,
+        )
+        
+        if residual is not None:
+            # The custom op will have updated residual in-place if needed
+            return output, residual
+        return output
+        
+    def forward_impl(
+        self,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> None:
+        """
+        Implementation called by the custom op.
+        This executes outside of torch.compile's graph.
+        """
+        result = self.forward_native(x, residual)
+        
+        if residual is not None:
+            # Unpack tuple result
+            output_data, residual_data = result
+            output.copy_(output_data)
+            residual.copy_(residual_data)
         else:
-            self._fwd_spyre = self._forward_static_spyre
-        
-        # self.forward_static = self.forward_static_spyre
+            output.copy_(result)
         
     @staticmethod
     def _forward_static_spyre(
@@ -67,7 +113,10 @@ class SpyreRMSNorm(RMSNorm):
         residual: torch.Tensor | None = None,
         variance_size_override: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward()."""
+        """PyTorch-native implementation for Spyre device.
+        
+        This method is compiled separately via self._fwd_spyre.
+        """
         
         x = x.transpose(1, 0).contiguous()
         
@@ -77,11 +126,6 @@ class SpyreRMSNorm(RMSNorm):
             # increasing memory usage (and complicating pattern matching)
             x = x + residual
             residual = x.to(orig_dtype)
-
-        # if x.shape[-1] != hidden_size:
-        #     raise ValueError(
-        #         f"Expected hidden_size to be {hidden_size}, but found: {x.shape[-1]}"
-        #     )
 
         if variance_size_override is None:
             x_var = x
@@ -113,11 +157,26 @@ class SpyreRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward()."""
+        """PyTorch-native implementation equivalent to forward().
+        
+        This method handles the Spyre-specific device operations including:
+        - Padding for minimum batch size requirements
+        - Data transfer to/from Spyre device
+        - Calling the compiled Spyre kernel
+        """
 
         if residual is not None:
-            raise NotImplementedError('TODO!')
+            raise NotImplementedError('TODO: Residual support not yet implemented')
 
+        # Store original batch size for later trimming
+        num_real_el = x.shape[0]
+        
+        # Pad to minimum batch size of 64 if needed
+        if x.shape[0] != 1 and x.shape[0] < 64:
+            x = torch.nn.functional.pad(x, (0, 0, 64 - num_real_el, 0))
+
+        # Execute the Spyre-compiled kernel
+        # _prepare_inputs_on_spyre handles device transfer and dtype conversion
         out = self._fwd_spyre(
             _prepare_inputs_on_spyre([x])[0],
             _prepare_inputs_on_spyre([torch.ones((x.shape[0])) * self.variance_epsilon])[0],
@@ -128,5 +187,43 @@ class SpyreRMSNorm(RMSNorm):
             self.variance_size_override,
         )
         
+        # Transfer result back to CPU
         spyre_out = out.cpu()
+        
+        # Remove padding to restore original batch size
+        spyre_out = spyre_out[:num_real_el, :]
+        
+        # Convert to expected output dtype
         return spyre_out.to(torch.bfloat16)
+
+
+# Custom op implementation
+def spyre_rmsnorm(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    residual: torch.Tensor | None = None,
+) -> None:
+    """Custom op that calls the SpyreRMSNorm layer outside of compilation."""
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    layer.forward_impl(x, output, residual)
+
+
+def spyre_rmsnorm_fake(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    residual: torch.Tensor | None = None,
+) -> None:
+    """Fake implementation for shape inference during compilation."""
+    return
+
+
+# Register the custom op
+direct_register_custom_op(
+    op_name="spyre_rmsnorm",
+    op_func=spyre_rmsnorm,
+    mutates_args=["output"],
+    fake_impl=spyre_rmsnorm_fake,
+)
