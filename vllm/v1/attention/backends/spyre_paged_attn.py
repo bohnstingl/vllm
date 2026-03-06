@@ -435,35 +435,65 @@ class SpyreAttentionPagedImpl(AttentionImpl[SpyreAttentionPagedMetadata]):
         mask: torch.Tensor,   # [num_seqs, 1, max_query_len, max_seq_len]  True=masked
     ) -> torch.Tensor:
         """
-        Compute batched per-sequence attention.
+        Compute batched per-sequence attention with GQA via reshape+broadcast.
+
+        Avoids repeat_interleave to expand KV heads (profiling showed it costs
+        ~17 ms/layer vs ~0.18 ms for the actual matmuls on 30 seqs × 300 tok).
+        Instead, Q is reshaped to expose the GQA grouping so that K/V can be
+        broadcast over the query-group dimension without materialising the
+        expanded tensors:
+
+            Q  [B, Hkv, Gq, q_len, D]  ×  K  [B, Hkv,  1, kv_len, D]^T
+            -> scores [B, Hkv, Gq, q_len, kv_len]
+
+        All operations are pure torch.matmul / torch.softmax / masked_fill.
+
+        # Alternative (requires PyTorch ≥ 2.5):
+        # out = torch.nn.functional.scaled_dot_product_attention(
+        #     query.transpose(1, 2),   # [B, H,   q_len,  D]
+        #     key.transpose(1, 2),     # [B, Hkv, kv_len, D]
+        #     value.transpose(1, 2),
+        #     attn_mask=~mask,         # bool: True = attend
+        #     scale=self.scale,
+        #     enable_gqa=True,
+        # ).transpose(1, 2)
 
         Returns:
             [num_seqs, max_query_len, num_heads, head_size]
         """
-        if self.num_queries_per_kv > 1:
-            key = key.repeat_interleave(self.num_queries_per_kv, dim=2)
-            value = value.repeat_interleave(self.num_queries_per_kv, dim=2)
+        B      = query.shape[0]
+        q_len  = query.shape[1]
+        kv_len = key.shape[1]
+        Hkv    = self.num_kv_heads
+        Gq     = self.num_queries_per_kv  # Q heads per KV head
+        D      = self.head_size
 
-        # Transpose to [num_seqs, num_heads, seq_len, head_size]
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
+        # Q: [B, H, q_len, D] → [B, Hkv, Gq, q_len, D]
+        q = query.transpose(1, 2).reshape(B, Hkv, Gq, q_len, D)
 
-        # Q @ K^T: [num_seqs, num_heads, max_query_len, max_seq_len]
-        attn_scores = torch.matmul(
-            query.to(self.working_precision),
-            key.to(self.working_precision).transpose(-2, -1),
+        # K/V: [B, Hkv, kv_len, D] → unsqueeze Gq dim for broadcast
+        # Shape: [B, Hkv, 1, kv_len, D]  (never materialised as Gq copies)
+        k = key.transpose(1, 2).unsqueeze(2)    # [B, Hkv, 1, kv_len, D]
+        v = value.transpose(1, 2).unsqueeze(2)  # [B, Hkv, 1, kv_len, D]
+
+        # Scores: [B, Hkv, Gq, q_len, kv_len]
+        scores = torch.matmul(
+            q.to(self.working_precision),
+            k.to(self.working_precision).transpose(-2, -1),
         ) * self.scale
 
-        attn_scores = attn_scores.masked_fill(mask, -float("inf"))
+        # mask [B, 1, q_len, kv_len] → unsqueeze to [B, 1, 1, q_len, kv_len]
+        # for broadcast over Hkv and Gq
+        scores = scores.masked_fill(mask.unsqueeze(1), -float("inf"))
 
-        attn_weights = torch._safe_softmax(attn_scores, dim=-1)
+        weights = torch.softmax(scores, dim=-1)
 
-        # [num_seqs, num_heads, max_query_len, head_size]
-        attn_output = torch.matmul(attn_weights.to(query.dtype), value.to(query.dtype))
+        # Output: [B, Hkv, Gq, q_len, D] → [B, H, q_len, D]
+        out = torch.matmul(weights, v.to(self.working_precision))
+        out = out.to(query.dtype).reshape(B, Hkv * Gq, q_len, D)
 
-        # [num_seqs, max_query_len, num_heads, head_size]
-        return attn_output.transpose(1, 2)
+        # [B, q_len, H, D]
+        return out.transpose(1, 2)
 
     def _extract_relevant_output(
         self,
