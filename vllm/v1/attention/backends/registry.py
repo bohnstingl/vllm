@@ -82,6 +82,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     )
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     PYTORCH_NATIVE = "vllm.v1.attention.backends.pytorch_native_attn.PyTorchNativeAttentionBackend"
+    PYTORCH_NATIVE2 = "vllm.v1.attention.backends.spyre_paged_attn.SpyreAttentionPagedBackend"
     # Placeholder for third-party/custom backends - must be registered before use
     # set to None to avoid alias with other backend, whose value is an empty string
     CUSTOM = None

@@ -13,6 +13,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -198,6 +201,19 @@ class SpyreAttentionPagedImpl(AttentionImpl[SpyreAttentionPagedMetadata]):
         else:
             self.working_precision = torch.bfloat16
 
+        # When True, use torch.nn.functional.scaled_dot_product_attention
+        # Otherwise, use implementation with native PyTorch ops 
+        import os
+        self.use_sdpa = os.environ.get("SPYRE_USE_SDPA", "0") == "1"
+
+        self._logged_first_forward = False
+
+        logger.info(
+            "SpyreAttentionPagedImpl initialized: "
+            "num_heads=%d, num_kv_heads=%d, head_size=%d, use_sdpa=%s",
+            num_heads, num_kv_heads, head_size, self.use_sdpa,
+        )
+
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
         if sliding_window is not None:
@@ -223,6 +239,16 @@ class SpyreAttentionPagedImpl(AttentionImpl[SpyreAttentionPagedMetadata]):
 
         if attn_metadata is None:
             return output.fill_(0)
+
+        if not self._logged_first_forward:
+            self._logged_first_forward = True
+            logger.info(
+                "SpyreAttentionPagedImpl.forward() first call: "
+                "num_seqs=%d, num_actual_tokens=%d, use_sdpa=%s",
+                attn_metadata.num_seqs,
+                attn_metadata.num_actual_tokens,
+                self.use_sdpa,
+            )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -468,6 +494,25 @@ class SpyreAttentionPagedImpl(AttentionImpl[SpyreAttentionPagedMetadata]):
         Gq     = self.num_queries_per_kv  # Q heads per KV head
         D      = self.head_size
 
+        if self.use_sdpa:
+            # torch.nn.functional.scaled_dot_product_attention path.
+            # Requires PyTorch ≥ 2.5 for enable_gqa support.
+            # Q:   [B, q_len,  H,   D] → [B, H,   q_len,  D]
+            # K/V: [B, kv_len, Hkv, D] → [B, Hkv, kv_len, D]
+            # attn_mask: [B, 1, q_len, kv_len]  True=attend (invert our mask)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query.transpose(1, 2),    # [B, H,   q_len,  D]
+                key.transpose(1, 2),      # [B, Hkv, kv_len, D]
+                value.transpose(1, 2),    # [B, Hkv, kv_len, D]
+                attn_mask=~mask,          # bool: True = attend
+                scale=self.scale,
+                enable_gqa=True,
+            )
+            # [B, H, q_len, D] → [B, q_len, H, D]
+            return out.transpose(1, 2)
+
+        # --- Manual matmul/softmax path ---
+
         # Q: [B, H, q_len, D] → [B, Hkv, Gq, q_len, D]
         q = query.transpose(1, 2).reshape(B, Hkv, Gq, q_len, D)
 
@@ -487,6 +532,12 @@ class SpyreAttentionPagedImpl(AttentionImpl[SpyreAttentionPagedMetadata]):
         scores = scores.masked_fill(mask.unsqueeze(1), -float("inf"))
 
         weights = torch.softmax(scores, dim=-1)
+
+        # Padding query rows (q >= query_len for each seq) get all-masked scores → softmax NaN.
+        # On some BLAS/CPU backends, NaN in padding rows can contaminate valid rows in
+        # the following matmul.  Zero them out before the matmul; the padding output is
+        # discarded by _extract_relevant_output anyway.
+        weights = weights.nan_to_num(nan=0.0)
 
         # Output: [B, Hkv, Gq, q_len, D] → [B, H, q_len, D]
         out = torch.matmul(weights, v.to(self.working_precision))

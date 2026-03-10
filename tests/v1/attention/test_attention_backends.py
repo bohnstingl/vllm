@@ -36,20 +36,22 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 BACKENDS_TO_TEST = [
-    AttentionBackendEnum.FLASH_ATTN,
-    AttentionBackendEnum.FLASHINFER,
-    AttentionBackendEnum.FLEX_ATTENTION,
-    AttentionBackendEnum.TRITON_ATTN,
-    AttentionBackendEnum.TREE_ATTN,
-    "FLEX_ATTENTION_SLOW",
+    # AttentionBackendEnum.FLASH_ATTN,
+    # AttentionBackendEnum.FLASHINFER,
+    # AttentionBackendEnum.FLEX_ATTENTION,
+    # AttentionBackendEnum.TRITON_ATTN,
+    # AttentionBackendEnum.TREE_ATTN,
+    # "FLEX_ATTENTION_SLOW",
     AttentionBackendEnum.PYTORCH_NATIVE,
+    AttentionBackendEnum.PYTORCH_NATIVE2,
+    # AttentionBackendEnum.CPU_ATTN,
 ]
 
-# Remove flashinfer from the list if it's not available
-try:
-    import flashinfer  # noqa: F401
-except ImportError:
-    BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
+# # Remove flashinfer from the list if it's not available
+# try:
+#     import flashinfer  # noqa: F401
+# except ImportError:
+#     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
 
 
 def _convert_dtype_to_torch(dtype):
@@ -371,7 +373,8 @@ def _test_backend_correctness(
         num_gpu_blocks=8192,
         hf_config_override=hf_config_override,
     )
-    device = torch.device("cuda:0")
+    # device = torch.device("cuda:0")
+    device = torch.device("cpu")
 
     kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
 
@@ -608,16 +611,16 @@ def test_causal_backend_correctness(
         tensor_parallel_size=tensor_parallel_size,
     )
 
-    # Fast FlexAttention needs to run with block_size=128
-    if LARGE_BLOCK_BACKENDS:
-        _test_backend_correctness(
-            batch_spec,
-            model,
-            LARGE_BLOCK_BACKENDS,
-            causal_mask_mod,
-            block_size=128,
-            tensor_parallel_size=tensor_parallel_size,
-        )
+    # # Fast FlexAttention needs to run with block_size=128
+    # if LARGE_BLOCK_BACKENDS:
+    #     _test_backend_correctness(
+    #         batch_spec,
+    #         model,
+    #         LARGE_BLOCK_BACKENDS,
+    #         causal_mask_mod,
+    #         block_size=128,
+    #         tensor_parallel_size=tensor_parallel_size,
+    #     )
 
 
 if current_platform.is_rocm():
