@@ -118,6 +118,7 @@ def evaluate_gsm8k(
     port: int = 8000,
     temperature: float = 0.0,
     seed: int | None = 42,
+    request_timeout: float | None = None,
 ) -> dict[str, float | int]:
     """
     Evaluate GSM8K accuracy using vLLM serve endpoint.
@@ -170,7 +171,7 @@ def evaluate_gsm8k(
             return answer, tokens
 
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=600)
+            timeout=aiohttp.ClientTimeout(total=request_timeout)
         ) as session:
             tasks = [get_answer(session, i) for i in range(num_questions)]
             await tqdm.gather(*tasks, desc="Evaluating")
