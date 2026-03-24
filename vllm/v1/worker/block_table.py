@@ -6,7 +6,7 @@ import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.utils import CpuGpuBuffer
@@ -141,21 +141,103 @@ class BlockTable:
         num_tokens = positions.shape[0]
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        _compute_slot_mapping_kernel[(num_reqs + 1,)](
-            num_tokens,
-            self.max_num_batched_tokens,
-            query_start_loc,
-            positions,
-            self.block_table.gpu,
-            self.block_table.gpu.stride(0),
-            self.block_size,
-            self.slot_mapping.gpu,
-            TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-            TOTAL_CP_RANK=total_cp_rank,
-            CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-            PAD_ID=PAD_SLOT_ID,
-            BLOCK_SIZE=1024,
-        )
+        if HAS_TRITON:
+            _compute_slot_mapping_kernel[(num_reqs + 1,)](
+                num_tokens,
+                self.max_num_batched_tokens,
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.block_table.gpu.stride(0),
+                self.block_size,
+                self.slot_mapping.gpu,
+                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
+                TOTAL_CP_RANK=total_cp_rank,
+                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
+                PAD_ID=PAD_SLOT_ID,
+                BLOCK_SIZE=1024,
+            )
+        else:
+            self._compute_slot_mapping_numpy(
+                num_reqs,
+                num_tokens,
+                query_start_loc,
+                positions,
+                total_cp_world_size,
+                total_cp_rank,
+            )
+
+    def _compute_slot_mapping_numpy(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        total_cp_world_size: int,
+        total_cp_rank: int,
+    ) -> None:
+        """NumPy fallback for slot mapping when Triton is unavailable."""
+        # Convert tensors to NumPy and reconstruct per-token req_indices
+        # from query_start_loc.
+        query_start_loc = query_start_loc[: num_reqs + 1].cpu().numpy()
+        positions = positions[:num_tokens].cpu().numpy()
+        req_indices = np.empty(num_tokens, dtype=np.int32)
+        for i in range(num_reqs):
+            req_indices[query_start_loc[i] : query_start_loc[i + 1]] = i
+
+        if total_cp_world_size > 1:
+            # Note(hc): The DCP implement store kvcache with an interleave
+            # style, the kvcache for the token whose token_idx is i is
+            # always stored on the GPU whose dcp_rank equals i % cp_world_size:
+
+            # Use a "virtual block" which equals to world_size * block_size
+            # for block_table_indices calculation.
+            virtual_block_size = self.block_size * total_cp_world_size
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req
+                + positions // virtual_block_size
+            )
+
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            # Use virtual_block_size for mask calculation, which marks local
+            # tokens.
+            virtual_block_offsets = positions % virtual_block_size
+            mask = (
+                virtual_block_offsets
+                // self.cp_kv_cache_interleave_size
+                % total_cp_world_size
+                == total_cp_rank
+            )
+            # Calculate local block_offsets
+            block_offsets = (
+                virtual_block_offsets
+                // (total_cp_world_size * self.cp_kv_cache_interleave_size)
+                * self.cp_kv_cache_interleave_size
+                + virtual_block_offsets % self.cp_kv_cache_interleave_size
+            )
+            # Calculate slot_mapping
+            slot_mapping = block_numbers * self.block_size + block_offsets
+            # Write final slots, use PAD_SLOT_ID for not-local
+            self.slot_mapping.np[:num_tokens] = np.where(
+                mask, slot_mapping, PAD_SLOT_ID
+            )
+        else:
+            block_table_indices = (
+                req_indices * self.max_num_blocks_per_req + positions // self.block_size
+            )
+
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            block_offsets = positions % self.block_size
+            np.add(
+                block_numbers * self.block_size,
+                block_offsets,
+                out=self.slot_mapping.np[:num_tokens],
+            )
+
+        # Pad remaining slots and copy to GPU.
+        if num_tokens < self.max_num_batched_tokens:
+            self.slot_mapping.np[num_tokens : self.max_num_batched_tokens] = PAD_SLOT_ID
+        self.slot_mapping.copy_to_gpu(self.max_num_batched_tokens)
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
