@@ -62,9 +62,7 @@ class TestNewGELU:
         # Sanity: gelu_new is odd-symmetric around 0 up to the cubic term,
         # and gelu_new(0) == 0.
         zero = torch.zeros((), dtype=dtype)
-        torch.testing.assert_close(
-            gelu_new_native(zero), zero, atol=1e-3, rtol=1e-3
-        )
+        torch.testing.assert_close(gelu_new_native(zero), zero, atol=1e-3, rtol=1e-3)
         # Large positive input → approximately x (sigmoid-tanh saturates to 1).
         big = torch.tensor(5.0, dtype=dtype)
         torch.testing.assert_close(

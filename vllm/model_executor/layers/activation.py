@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom activation functions."""
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -459,6 +457,9 @@ class NewGELU(CustomOp):
         return ir.ops.gelu_new(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return ir.ops.gelu_new(x)
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return ir.ops.gelu_new(x)
 
 
