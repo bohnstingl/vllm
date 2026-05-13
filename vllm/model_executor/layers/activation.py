@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Import kernels to trigger IR impl registration
+import vllm.kernels  # noqa: F401
+from vllm import ir
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -448,27 +451,15 @@ class SwigluStepAndMul(CustomOp):
 class NewGELU(CustomOp):
     # --8<-- [end:gelu_new]
 
-    def __init__(self):
-        super().__init__()
-        if (
-            current_platform.is_cuda_alike()
-            or current_platform.is_cpu()
-            or current_platform.is_xpu()
-        ):
-            self.op = torch.ops._C.gelu_new
+    def __init__(self, *, compile_native: bool = True):
+        super().__init__(compile_native=compile_native)
 
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        c = math.sqrt(2.0 / math.pi)
-        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
+    @staticmethod
+    def forward_native(x: torch.Tensor) -> torch.Tensor:
+        return ir.ops.gelu_new(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
-        self.op(out, x)
-        return out
-
-    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_cuda(x)
+        return ir.ops.gelu_new(x)
 
 
 # --8<-- [start:gelu_fast]

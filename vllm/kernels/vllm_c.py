@@ -11,6 +11,12 @@ current_platform.import_kernels()
 CUDA_ALIKE = current_platform.is_cuda_alike()
 """Most kernels in this file are supported on all CUDA-alike platforms."""
 
+CUDA_ALIKE_OR_CPU = CUDA_ALIKE or current_platform.is_cpu()
+"""Unary activation kernels (e.g. gelu_new) are registered for both
+CUDA-alike (via csrc/torch_bindings.cpp) and CPU (via
+csrc/cpu/torch_bindings.cpp). Same torch op name dispatches to the
+correct kernel based on tensor device."""
+
 rms_no_var_size = (
     lambda x, weight, epsilon, variance_size=None: variance_size is None
     and (weight is None or weight.dtype == x.dtype)
@@ -61,3 +67,10 @@ def fused_add_rms_norm(
     assert variance_size is None
     torch.ops._C.fused_add_rms_norm(x, x_residual, weight, epsilon)
     return x, x_residual
+
+
+@ir.ops.gelu_new.register_impl("vllm_c", supported=CUDA_ALIKE_OR_CPU)
+def gelu_new(x: Tensor) -> Tensor:
+    out = torch.empty_like(x)
+    torch.ops._C.gelu_new(out, x)
+    return out

@@ -64,3 +64,10 @@ def fused_add_rms_norm(
     assert variance_size is None
     torch.ops._C.fused_add_rms_norm(x, x_residual, weight, epsilon)
     return x, x_residual
+
+
+@ir.ops.gelu_new.register_impl("xpu_kernels", supported=XPU_KERNELS_SUPPORTED)
+def gelu_new(x: Tensor) -> Tensor:
+    out = torch.empty_like(x)
+    torch.ops._C.gelu_new(out, x)
+    return out
