@@ -58,6 +58,61 @@ def fp8_mqa_logits_torch(
     return logits
 
 
+def _bf16_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,  # uint8 [num_blocks, block_size, 1, dim*2] bf16 slots
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+):
+    """BF16-fallback paged MQA logits: read bf16 K directly, no fp8 scale.
+
+    Mirrors the CUDA-graph-safe ``next_n == 1`` path of the fp8 kernel but
+    the cache slot is ``dim`` bf16 values (no 4-byte scale)."""
+    batch_size, next_n, _, dim = q.size()
+    block_size = kv_cache.shape[1]
+    if context_lens.dim() > 1:
+        context_lens = context_lens.squeeze(-1)
+    head_width = dim * 2  # dim bf16 values, in bytes (uint8 cache)
+    kv_cache_flat = kv_cache.view(-1, block_size * head_width)
+
+    max_pages = block_tables.shape[1]
+    padded_seq_len = max_pages * block_size
+
+    pages = block_tables[:batch_size, :max_pages]
+    cache = kv_cache_flat[pages]  # [B, max_pages, block_size * head_width]
+
+    cache_value = (
+        cache.contiguous()
+        .view(torch.bfloat16)
+        .to(torch.float32)
+        .reshape(batch_size, padded_seq_len, dim)
+    )
+
+    q_fp32 = q[:, 0].to(torch.float32)  # [B, num_heads, dim]
+    weights_b = weights[:batch_size]  # [B, num_heads]
+
+    score = torch.einsum("btd,bhd->bth", cache_value, q_fp32)
+    score = F.relu(score)
+    score = score * weights_b.unsqueeze(1)
+    score = score.sum(dim=-1)  # [B, padded_seq_len]
+
+    pos = torch.arange(padded_seq_len, device=q.device, dtype=context_lens.dtype)
+    valid = pos.unsqueeze(0) < context_lens.unsqueeze(1)
+    score = torch.where(valid, score, torch.full_like(score, float("-inf")))
+
+    logits = torch.full(
+        [batch_size, max_model_len],
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    write_width = min(padded_seq_len, max_model_len)
+    logits[:, :write_width] = score[:, :write_width]
+    return logits
+
+
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
@@ -66,9 +121,19 @@ def fp8_paged_mqa_logits_torch(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    use_fp8: bool = True,
 ):
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
+    if not use_fp8:
+        return _bf16_paged_mqa_logits_torch(
+            q,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
     if next_n == 1:
         # CUDA-graph safe: no .item() syncs and no per-batch Python loop.
         # Compute over the full padded shape and mask invalid positions

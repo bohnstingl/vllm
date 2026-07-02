@@ -44,9 +44,15 @@ logger = init_logger(__name__)
 
 
 def kernel_warmup(worker: "Worker"):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
-    )
+    try:
+        from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+            minimax_m3_msa_warmup,
+        )
+    except ImportError:
+        # MiniMax-M3 warmup pulls optional deps (e.g. torchvision) via its
+        # multimodal processor. If unavailable, skip it -- it is a no-op for
+        # every non-MiniMax-M3 model anyway.
+        minimax_m3_msa_warmup = None
 
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
@@ -83,7 +89,8 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
-    minimax_m3_msa_warmup(worker)
+    if minimax_m3_msa_warmup is not None:
+        minimax_m3_msa_warmup(worker)
 
     enable_flashinfer_autotune = (
         worker.vllm_config.kernel_config.enable_flashinfer_autotune

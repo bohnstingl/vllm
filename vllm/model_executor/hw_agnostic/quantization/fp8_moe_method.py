@@ -15,6 +15,7 @@ from vllm.model_executor.hw_agnostic.layers.fused_moe.all2all_utils import (
 )
 from vllm.model_executor.hw_agnostic.layers.fused_moe.config import (
     FusedMoEQuantConfig,
+    biased_moe_quant_config,
     fp8_w8a8_moe_quant_config,
 )
 from vllm.model_executor.hw_agnostic.layers.fused_moe.experts.triton_moe import (
@@ -58,6 +59,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )
         self.experts_cls = TritonExperts
+        # On platforms without native FP8 compute (e.g. sm_80), the FP8
+        # activation quant + FP8 tensor-core GEMM cannot run. Dequant the
+        # expert weights to BF16 at load time and run the unquantized
+        # (BF16) Triton MoE instead.
+        self.fp8_compute = current_platform.supports_fp8_compute()
 
     def create_weights(
         self,
@@ -230,11 +236,59 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
+        if not self.fp8_compute:
+            # Dequant FP8 experts to BF16 once; the BF16 Triton MoE runs
+            # with no FP8 compute. Replace weights with BF16 and drop the
+            # FP8 scales so ``get_fused_moe_quant_config`` returns the
+            # unquantized config.
+            w13 = self._dequant_expert_weight(w13, w13_scale, layer.orig_dtype)
+            w2 = self._dequant_expert_weight(w2, w2_scale, layer.orig_dtype)
+            replace_parameter(layer, "w13_weight", w13)
+            replace_parameter(layer, "w2_weight", w2)
+            self._setup_kernel(
+                layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
+            )
+            return
+
         self._setup_kernel(
             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
         )
 
+    def _dequant_expert_weight(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Dequant a stacked expert weight ``[E, N, K]`` to ``out_dtype``.
+
+        Block-quantized weights carry a ``[E, cdiv(N, bn), cdiv(K, bk)]``
+        scale; per-tensor weights carry a ``[E]``/``[E, 1]`` scale.
+        """
+        w = weight.to(torch.float32)
+        scale = weight_scale.to(torch.float32)
+        if self.block_quant:
+            assert self.weight_block_size is not None
+            block_n, block_k = self.weight_block_size
+            _, n, k = w.shape
+            scale = scale.repeat_interleave(block_n, dim=1).repeat_interleave(
+                block_k, dim=2
+            )
+            scale = scale[:, :n, :k]
+            return (w * scale).to(out_dtype)
+        # Per-tensor / per-expert scalar scale.
+        scale = scale.reshape(scale.shape[0], *([1] * (w.ndim - 1)))
+        return (w * scale).to(out_dtype)
+
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
+        if not self.fp8_compute:
+            # Weights were dequantized to BF16; run the unquantized MoE.
+            return biased_moe_quant_config(
+                w1_bias=getattr(layer, "w13_bias", None),
+                w2_bias=getattr(layer, "w2_bias", None),
+                gemm1_clamp_limit=getattr(layer, "swiglu_limit", None),
+            )
+
         quant_config = fp8_w8a8_moe_quant_config(
             w1_scale=getattr(layer, f"w13_{self.weight_scale_name}"),
             w2_scale=getattr(layer, f"w2_{self.weight_scale_name}"),

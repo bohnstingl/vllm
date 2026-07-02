@@ -10,6 +10,9 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.hw_agnostic._custom_op_lib import vllm_hw_agnostic_lib
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    kv_cache_uses_fp8,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention.indexer import (
     DeepseekV4IndexerMetadata,
 )
@@ -43,13 +46,18 @@ logger = init_logger(__name__)
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
-    fp8_dtype: torch.dtype,
+    values_dtype: torch.dtype,
 ) -> tuple[tuple[tuple[int, int], torch.dtype], tuple[tuple[int, int], torch.dtype]]:
     """Return ((values_shape, values_dtype), (scales_shape, scales_dtype)) for
-    the K-gather workspace: ``(T, head_dim)`` fp8 + ``(T, 4)`` uint8 fp32
-    scales."""
+    the K-gather workspace: ``(T, head_dim)`` values + ``(T, 4)`` uint8 fp32
+    scales.
+
+    ``values_dtype`` is the platform fp8 type for the packed cache, or
+    ``torch.bfloat16`` for the BF16 fallback. The 4-byte scale slot is
+    still reserved in both cases (unused, but keeps the workspace layout
+    stable)."""
     return (
-        ((total_seq_lens, head_dim), fp8_dtype),
+        ((total_seq_lens, head_dim), values_dtype),
         ((total_seq_lens, 4), torch.uint8),
     )
 
@@ -78,7 +86,8 @@ def dsv4_sparse_attn_indexer(
     skip_k_cache_insert: bool,
 ) -> torch.Tensor:
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype()
+    use_fp8 = kv_cache_uses_fp8()
+    values_dtype = current_platform.fp8_dtype() if use_fp8 else torch.bfloat16
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     if not isinstance(attn_metadata, dict):
@@ -86,7 +95,7 @@ def dsv4_sparse_attn_indexer(
         # K-gather workspace and the peak logits allocation so memory
         # planning sees real high-water marks, then return the fake op.
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype
+            total_seq_lens, head_dim, values_dtype
         )
         current_workspace_manager().get_simultaneous(
             values_spec,
@@ -149,7 +158,7 @@ def dsv4_sparse_attn_indexer(
         # use). Layout: ``head_dim`` fp8 bytes + 4-byte fp32 scale per token.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype
+            total_seq_lens, head_dim, values_dtype
         )
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
             values_spec,
@@ -170,7 +179,13 @@ def dsv4_sparse_attn_indexer(
                 )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
-            k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            if use_fp8:
+                k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+            else:
+                # BF16 gather stores raw values; per-token scale is 1.0.
+                k_scale_cast = torch.ones(
+                    k_quant.shape[0], dtype=torch.float32, device=k_quant.device
+                )
             logits = fp8_mqa_logits_torch(
                 q_slice,
                 (k_quant, k_scale_cast),
@@ -215,6 +230,7 @@ def dsv4_sparse_attn_indexer(
             seq_lens,
             decode_metadata.block_table,
             max_model_len,
+            use_fp8=use_fp8,
         )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         topk_indices.copy_(topk_indices_torch(logits, topk_tokens))

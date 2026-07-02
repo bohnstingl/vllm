@@ -4,6 +4,11 @@
 
 import torch
 
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    BF16_TOKEN_BYTES,
+    FP8_TOKEN_DATA_SIZE,
+    kv_cache_uses_fp8,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention.kernels.triton_mla_sparse import (
     triton_bf16_mla_sparse_interface,
 )
@@ -36,6 +41,7 @@ def _dequant_gather_slots_kernel(
     quant_block: tl.constexpr,  # 64
     output_dim: tl.constexpr,  # 512
     n_quant_blocks: tl.constexpr,  # 7
+    USE_FP8: tl.constexpr,  # True: packed fp8_ds_mla; False: bf16 fallback
 ):
     """Dequantize scattered FP8 slots into a flat BF16 workspace.
 
@@ -72,39 +78,51 @@ def _dequant_gather_slots_kernel(
     # Token data: at offset pos_in_block * token_data_size within block
     token_data_ptr = block_base + pos_in_block * token_data_size
 
-    # Scale: after all token data, at offset
-    # cache_block_size * token_data_size + pos_in_block * scale_dim
-    scale_region_offset = tl.cast(cache_block_size, tl.int64) * token_data_size
-    token_scale_ptr = block_base + scale_region_offset + pos_in_block * scale_dim
+    # NOTE: the fp8 branch must live under ``else`` (not after an early
+    # return): Triton compiles the whole body, so a top-level
+    # ``tl.float8e4nv`` still fails on sm_80. Only the constexpr-guarded
+    # branch is dead-code-eliminated.
+    if not USE_FP8:
+        # BF16 fallback: copy all 512 bf16 values directly.
+        bf16_src_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+        for j in tl.static_range(output_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            vals = tl.load(bf16_src_ptr + chunk_offsets)
+            tl.store(out_row_ptr + chunk_offsets, vals)
+    else:
+        # Scale: after all token data, at offset
+        # cache_block_size * token_data_size + pos_in_block * scale_dim
+        scale_region_offset = tl.cast(cache_block_size, tl.int64) * token_data_size
+        token_scale_ptr = block_base + scale_region_offset + pos_in_block * scale_dim
 
-    # ========== Dequantize FP8 portion (448 elements) ==========
-    for qblock_idx in tl.static_range(n_quant_blocks):
-        qblock_start = qblock_idx * quant_block
-        offsets = qblock_start + tl.arange(0, quant_block)
-        mask = offsets < fp8_dim
+        # ========== Dequantize FP8 portion (448 elements) ==========
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
+            offsets = qblock_start + tl.arange(0, quant_block)
+            mask = offsets < fp8_dim
 
-        # Load FP8 as uint8 and bitcast
-        x_uint8 = tl.load(token_data_ptr + offsets, mask=mask, other=0)
-        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-        x_float = x_fp8.to(tl.float32)
+            # Load FP8 as uint8 and bitcast
+            x_uint8 = tl.load(token_data_ptr + offsets, mask=mask, other=0)
+            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+            x_float = x_fp8.to(tl.float32)
 
-        # Load UE8M0 scale: scale = 2^(stored_value - 127)
-        encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-        exponent = encoded_scale.to(tl.float32) - 127.0
-        scale = tl.exp2(exponent)
+            # Load UE8M0 scale: scale = 2^(stored_value - 127)
+            encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+            exponent = encoded_scale.to(tl.float32) - 127.0
+            scale = tl.exp2(exponent)
 
-        # Dequantize and store as bf16
-        x_dequant = x_float * scale
-        tl.store(out_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+            # Dequantize and store as bf16
+            x_dequant = x_float * scale
+            tl.store(out_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
 
-    # ========== Copy BF16 portion (64 elements) directly ==========
-    bf16_src_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
-    bf16_out_ptr = (out_row_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+        # ========== Copy BF16 portion (64 elements) directly ==========
+        bf16_src_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+        bf16_out_ptr = (out_row_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
 
-    for j in tl.static_range(bf16_dim // 16):
-        chunk_offsets = j * 16 + tl.arange(0, 16)
-        bf16_vals = tl.load(bf16_src_ptr + chunk_offsets)
-        tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+        for j in tl.static_range(bf16_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(bf16_src_ptr + chunk_offsets)
+            tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
 
 
 def dequant_gather_slots(
@@ -112,20 +130,25 @@ def dequant_gather_slots(
     cache: torch.Tensor,  # [num_blocks, block_size, head_bytes] uint8
     indices: torch.Tensor,  # [total_slots] int32, global slot IDs
     cache_block_size: int,  # block_size for this cache
+    use_fp8: bool | None = None,
 ) -> None:
     """Dequantize FP8 UE8M0 pages at scattered slot indices into bf16."""
     total_slots = indices.shape[0]
     if total_slots == 0:
         return
 
+    if use_fp8 is None:
+        use_fp8 = kv_cache_uses_fp8()
+
     block_stride = cache.stride(0)
+    token_data_size = FP8_TOKEN_DATA_SIZE if use_fp8 else BF16_TOKEN_BYTES
 
     _dequant_gather_slots_kernel[(total_slots,)](
         out,
         cache,
         indices,
         cache_block_size=cache_block_size,
-        token_data_size=TOKEN_DATA_SIZE,
+        token_data_size=token_data_size,
         block_stride=block_stride,
         fp8_dim=TOKEN_FP8_DIM,
         bf16_dim=TOKEN_BF16_DIM,
@@ -133,6 +156,7 @@ def dequant_gather_slots(
         quant_block=QUANT_BLOCK_SIZE,
         output_dim=OUTPUT_DIM,
         n_quant_blocks=7,
+        USE_FP8=use_fp8,
     )
 
 

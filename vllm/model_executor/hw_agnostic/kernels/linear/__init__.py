@@ -12,6 +12,7 @@ from vllm.platforms import PlatformEnum, current_platform
 
 from .base import MMLinearKernel, MMLinearLayerConfig
 from .scaled_mm import (
+    Bf16DequantFp8BlockScaledMMKernel,
     ChannelWiseTorchFP8ScaledMMLinearKernel,
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -23,6 +24,7 @@ from .scaled_mm import (
 logger = init_logger(__name__)
 
 __all__ = [
+    "Bf16DequantFp8BlockScaledMMKernel",
     "ChannelWiseTorchFP8ScaledMMLinearKernel",
     "FP8ScaledMMLinearKernel",
     "FP8ScaledMMLinearLayerConfig",
@@ -66,6 +68,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
 ] = {
     PlatformEnum.CUDA: [
         TritonFp8BlockScaledMMKernel,
+        Bf16DequantFp8BlockScaledMMKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
     ],
 }

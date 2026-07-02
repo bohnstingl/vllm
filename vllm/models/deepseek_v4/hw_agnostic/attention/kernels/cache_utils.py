@@ -4,6 +4,11 @@
 
 import torch
 
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    BF16_TOKEN_BYTES,
+    FP8_TOKEN_DATA_SIZE,
+    kv_cache_uses_fp8,
+)
 from vllm.triton_utils import tl, triton
 
 
@@ -22,10 +27,11 @@ def quantize_and_insert_k_kernel(
     scale_dim: tl.constexpr,  # 8
     quant_block: tl.constexpr,  # 64 (quantization block size)
     cache_block_size: tl.constexpr,  # 64 (paged cache block size)
-    token_data_size: tl.constexpr,  # 576 bytes per token data
+    token_data_size: tl.constexpr,  # 576 bytes (fp8) / 1024 bytes (bf16)
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+    USE_FP8: tl.constexpr,  # True: packed fp8_ds_mla; False: bf16 fallback
 ):
     pid = tl.program_id(0)
 
@@ -51,69 +57,83 @@ def quantize_and_insert_k_kernel(
     # Each token's data is at offset pos_in_block * token_data_size
     token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
 
-    # Scale pointer: scales are stored after ALL token data in the block
-    # Scale for this token is at offset (64 * 576) + pos_in_block * 8
-    token_scale_ptr = (
-        cache_block_ptr + cache_block_size * token_data_size + pos_in_block * scale_dim
-    )
+    if not USE_FP8:
+        # BF16 fallback: store all 512 values as bf16, no quant, no scale.
+        # NOTE: the fp8 branch below must live under ``else`` (not after an
+        # early return): Triton compiles every statement at module scope, so
+        # a top-level ``tl.float8e4nv`` would still fail on sm_80. Only a
+        # constexpr-guarded branch is dead-code-eliminated.
+        bf16_out_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+        for i in tl.static_range(input_dim // 16):
+            chunk_offsets = i * 16 + tl.arange(0, 16)
+            vals = tl.load(input_row_ptr + chunk_offsets)
+            tl.store(bf16_out_ptr + chunk_offsets, vals)
+    else:
+        # Scale pointer: scales are stored after ALL token data in the block
+        # Scale for this token is at offset (64 * 576) + pos_in_block * 8
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
 
-    # Token data layout: [0:448] fp8, [448:576] bf16
-    token_fp8_ptr = token_data_ptr
-    token_bf16_ptr = token_data_ptr + fp8_dim
+        # Token data layout: [0:448] fp8, [448:576] bf16
+        token_fp8_ptr = token_data_ptr
+        token_bf16_ptr = token_data_ptr + fp8_dim
 
-    # ========== Quantize and store FP8 portion (first 448 elements) ==========
-    # Using UE8M0 quantization strategy (scale is power of 2, stored as uint8 exponent)
-    for qblock_idx in tl.static_range(n_quant_blocks):
-        qblock_start = qblock_idx * quant_block
+        # ===== Quantize and store FP8 portion (first 448 elements) =====
+        # UE8M0 quant (scale is power of 2, stored as uint8 exponent).
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
 
-        if qblock_start < fp8_dim:
-            offsets = qblock_start + tl.arange(0, quant_block)
-            mask = offsets < fp8_dim
+            if qblock_start < fp8_dim:
+                offsets = qblock_start + tl.arange(0, quant_block)
+                mask = offsets < fp8_dim
 
-            # Load bf16 input
-            x = tl.load(input_row_ptr + offsets, mask=mask, other=0.0)
+                # Load bf16 input
+                x = tl.load(input_row_ptr + offsets, mask=mask, other=0.0)
 
-            # Compute absmax scale (same as CUDA kernel)
-            abs_x = tl.abs(x)
-            block_max = tl.max(abs_x, axis=0)
-            block_max = tl.maximum(block_max, 1e-4)  # Match CUDA: fmaxf(amax, 1e-4)
+                # Compute absmax scale (same as CUDA kernel)
+                abs_x = tl.abs(x)
+                block_max = tl.max(abs_x, axis=0)
+                block_max = tl.maximum(block_max, 1e-4)  # fmaxf(amax, 1e-4)
 
-            # UE8M0: Round scale UP to next power of 2
-            # scale = 2^ceil(log2(block_max / fp8_max))
-            raw_scale = block_max / fp8_max
-            log_scale = tl.log2(raw_scale)
-            exponent = tl.ceil(log_scale)  # Round UP to next integer exponent
-            scale = tl.exp2(exponent)  # scale = 2^exponent (power of 2)
+                # UE8M0: Round scale UP to next power of 2
+                # scale = 2^ceil(log2(block_max / fp8_max))
+                raw_scale = block_max / fp8_max
+                log_scale = tl.log2(raw_scale)
+                exponent = tl.ceil(log_scale)  # Round UP to next int exponent
+                scale = tl.exp2(exponent)  # scale = 2^exponent (power of 2)
 
-            # Quantize to fp8: fp8_value = bf16_value / scale
-            x_scaled = x / scale
-            x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+                # Quantize to fp8: fp8_value = bf16_value / scale
+                x_scaled = x / scale
+                x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8, then bitcast to uint8 for storage
-            x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                # Convert to fp8, then bitcast to uint8 for storage
+                x_fp8 = x_clamped.to(tl.float8e4nv)
+                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
-            # Store as uint8 (1 byte each)
-            tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+                # Store as uint8 (1 byte each)
+                tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
 
-            # UE8M0 scale encoding: stored_value = exponent + 127 (bias)
-            # During dequant: scale = 2^(stored_value - 127)
-            encoded_scale = exponent + 127.0
-            encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-            tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
+                # UE8M0 scale encoding: stored_value = exponent + 127 (bias)
+                # During dequant: scale = 2^(stored_value - 127)
+                encoded_scale = exponent + 127.0
+                encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
+                tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
 
-    # Padding scale at index 7
-    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+        # Padding scale at index 7
+        tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
 
-    # ========== Store BF16 portion (last 64 elements, no quantization) ==========
-    bf16_input_offset = fp8_dim
+        # ===== Store BF16 portion (last 64 elements, no quantization) =====
+        bf16_input_offset = fp8_dim
 
-    # Process bf16 in chunks of 16
-    bf16_out_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-    for i in tl.static_range(bf16_dim // 16):
-        chunk_offsets = i * 16 + tl.arange(0, 16)
-        bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
-        tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+        # Process bf16 in chunks of 16
+        bf16_out_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+        for i in tl.static_range(bf16_dim // 16):
+            chunk_offsets = i * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
+            tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
 
 
 def quantize_and_insert_k_cache(
@@ -122,12 +142,16 @@ def quantize_and_insert_k_cache(
     slot_mapping: torch.Tensor,  # [num_tokens] int64
     block_size: int = 64,
     is_ue8m0: bool = True,
+    use_fp8: bool | None = None,
 ):
     assert k.dim() == 2 and k.shape[1] == 512, (
         f"K must be [num_tokens, 512], got {k.shape}"
     )
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
+
+    if use_fp8 is None:
+        use_fp8 = kv_cache_uses_fp8()
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -139,7 +163,8 @@ def quantize_and_insert_k_cache(
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    # Per-token slot size differs by layout (see _fp8_support).
+    TOKEN_DATA_SIZE = FP8_TOKEN_DATA_SIZE if use_fp8 else BF16_TOKEN_BYTES
 
     grid = (num_tokens,)
 
@@ -158,6 +183,7 @@ def quantize_and_insert_k_cache(
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
+        USE_FP8=use_fp8,
     )
 
 
@@ -183,6 +209,7 @@ def _dequantize_and_gather_k_kernel(
     output_dim: tl.constexpr,  # 512
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
+    USE_FP8: tl.constexpr,  # True: packed fp8_ds_mla; False: bf16 fallback
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -215,60 +242,76 @@ def _dequantize_and_gather_k_kernel(
         # Token data pointer
         token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
 
-        # Scale pointer: after all token data
-        token_scale_ptr = (
-            cache_block_ptr
-            + cache_block_size * token_data_size
-            + pos_in_block * scale_dim
-        )
-
-        # Token data layout: [0:448] fp8, [448:576] bf16
-        token_fp8_ptr = token_data_ptr
-        token_bf16_ptr = token_data_ptr + fp8_dim
-
         # Output pointer for this token (flattened)
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
-        # ========== Dequantize FP8 portion using UE8M0 ==========
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
+        # NOTE: the fp8 branch must live under ``else`` (not after a
+        # ``continue``): Triton compiles the whole loop body, so a
+        # ``tl.float8e4nv`` outside a constexpr guard still fails on sm_80.
+        if not USE_FP8:
+            # BF16 fallback: copy all 512 bf16 values directly.
+            bf16_cache_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+            for j in tl.static_range(output_dim // 16):
+                chunk_offsets = j * 16 + tl.arange(0, 16)
+                vals = tl.load(bf16_cache_ptr + chunk_offsets)
+                tl.store(output_row_ptr + chunk_offsets, vals)
+        else:
+            # Scale pointer: after all token data
+            token_scale_ptr = (
+                cache_block_ptr
+                + cache_block_size * token_data_size
+                + pos_in_block * scale_dim
+            )
 
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
+            # Token data layout: [0:448] fp8, [448:576] bf16
+            token_fp8_ptr = token_data_ptr
+            token_bf16_ptr = token_data_ptr + fp8_dim
 
-                # Load quantized fp8 values (stored as uint8)
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+            # ========== Dequantize FP8 portion using UE8M0 ==========
+            for qblock_idx in tl.static_range(n_quant_blocks):
+                qblock_start = qblock_idx * quant_block
 
-                # Bitcast uint8 back to fp8
-                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+                if qblock_start < fp8_dim:
+                    offsets = qblock_start + tl.arange(0, quant_block)
+                    mask = offsets < fp8_dim
 
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    # Load quantized fp8 values (stored as uint8)
+                    x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
+                    # Bitcast uint8 back to fp8
+                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
 
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
+                    # Convert fp8 to float32 for computation
+                    x_float = x_fp8.to(tl.float32)
 
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                    # Load and decode UE8M0 scale: scale = 2^(stored - 127)
+                    encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                    exponent = encoded_scale.to(tl.float32) - 127.0
+                    scale = tl.exp2(exponent)
 
-        # ========== Copy BF16 portion directly ==========
-        bf16_output_offset = fp8_dim  # After 448 elements in output
+                    # Dequantize: bf16_value = fp8_value * scale
+                    x_dequant = x_float * scale
 
-        # Read bf16 from cache
-        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+                    # Store as bf16
+                    tl.store(
+                        output_row_ptr + offsets,
+                        x_dequant.to(tl.bfloat16),
+                        mask=mask,
+                    )
 
-        # Process in chunks of 16
-        for j in tl.static_range(bf16_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+            # ========== Copy BF16 portion directly ==========
+            bf16_output_offset = fp8_dim  # After 448 elements in output
+
+            # Read bf16 from cache
+            bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+
+            # Process in chunks of 16
+            for j in tl.static_range(bf16_dim // 16):
+                chunk_offsets = j * 16 + tl.arange(0, 16)
+                bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+                tl.store(
+                    output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals
+                )
 
 
 def dequantize_and_gather_k_cache_triton(
@@ -284,13 +327,17 @@ def dequantize_and_gather_k_cache_triton(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    use_fp8: bool | None = None,
 ) -> None:
+    if use_fp8 is None:
+        use_fp8 = kv_cache_uses_fp8()
+
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    TOKEN_DATA_SIZE = FP8_TOKEN_DATA_SIZE if use_fp8 else BF16_TOKEN_BYTES
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
@@ -314,6 +361,7 @@ def dequantize_and_gather_k_cache_triton(
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
+        USE_FP8=use_fp8,
     )
 
 

@@ -27,6 +27,9 @@ from vllm.model_executor.hw_agnostic.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    kv_cache_uses_fp8,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention.kernels import (
     compress_norm_rope_store_triton,
     save_partial_states,
@@ -230,14 +233,24 @@ class DeepseekCompressor(nn.Module):
             vllm_config.compilation_config.static_forward_context
         )
 
+        # On non-FP8 HW the cache slot is bf16 (2 bytes/elem, no scale block).
+        self._use_fp8 = kv_cache_uses_fp8()
         if self.head_dim == 512:
             self._quant_block = 64
-            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
-            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+            if self._use_fp8:
+                self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+                self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+            else:
+                self._token_stride = self.head_dim * 2  # 512 bf16
+                self._scale_dim = 0
         elif self.head_dim == 128:
             self._quant_block = 128
-            self._token_stride = self.head_dim
-            self._scale_dim = 4  # single float32 scale
+            if self._use_fp8:
+                self._token_stride = self.head_dim
+                self._scale_dim = 4  # single float32 scale
+            else:
+                self._token_stride = self.head_dim * 2  # 128 bf16
+                self._scale_dim = 0
         else:
             raise ValueError(
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
@@ -321,4 +334,5 @@ class DeepseekCompressor(nn.Module):
             quant_block=self._quant_block,
             token_stride=self._token_stride,
             scale_dim=self._scale_dim,
+            use_fp8=self._use_fp8,
         )

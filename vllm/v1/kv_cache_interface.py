@@ -378,6 +378,11 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "bf16_ds_mla":
+            # DeepseekV4 BF16 fallback (non-FP8 HW): all 512 values stored as
+            # bf16, no scale block => 1024B per token.
+            assert self.model_version == "deepseek_v4"
+            return self.storage_block_size * 1024
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -610,6 +615,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
             # the element-size formula below.
             return self.storage_block_size * 584
+        if (
+            self.model_version == "deepseek_v4"
+            and self.cache_dtype_str == "bf16_ds_mla"
+        ):
+            # DeepseekV4 BF16 fallback: 512 bf16 values = 1024B per token.
+            return self.storage_block_size * 1024
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"
         )

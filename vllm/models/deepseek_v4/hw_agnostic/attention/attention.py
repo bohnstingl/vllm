@@ -32,6 +32,11 @@ from vllm.model_executor.hw_agnostic.v1.kv_cache_interface import (
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.models.deepseek_v4.hw_agnostic.attention.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    DSV4_BF16_DS_MLA,
+    kv_cache_uses_fp8,
+    mla_head_bytes,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
@@ -160,14 +165,10 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
-        # FP8 sparse layout; other dtypes live in HW-specific subtrees and
-        # are rejected at quant-config construction on this path.
-        head_bytes = (
-            self.nope_head_dim  # 448 fp8 NoPE
-            + self.rope_head_dim * 2  # 64 bf16 RoPE
-            + self.nope_head_dim // 64  # 7B scale
-            + 1  # 1B pad
-        )
+        # Sparse-MLA cache slot size. FP8 packs 448 fp8 NoPE + 64 bf16 RoPE
+        # + 8B UE8M0 scale; the BF16 fallback (non-FP8 HW) stores all 512
+        # elements as bf16 with no scale block. See ``_fp8_support``.
+        head_bytes = mla_head_bytes()
 
         assert cache_config is not None
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -459,16 +460,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 requires fp8 kv-cache, got {kv_cache_dtype}"
-        )
         assert issubclass(self.get_attn_backend(), DeepseekV4HWAgnosticBackend)
-        # Coerce ``fp8`` alias to the V4 layout (584B/token, UE8M0-block FP8).
-        if kv_cache_dtype != "fp8_ds_mla":
+        self.use_fp8_cache = kv_cache_uses_fp8()
+        # Coerce to the V4 sparse-MLA layout. FP8 HW uses the packed
+        # ``fp8_ds_mla`` layout (584B/token, UE8M0-block FP8); non-FP8 HW
+        # (e.g. sm_80) falls back to an all-BF16 slot with the same paged
+        # geometry (``DSV4_BF16_DS_MLA``, 1024B/token, no scale block).
+        target_cache_dtype = "fp8_ds_mla" if self.use_fp8_cache else DSV4_BF16_DS_MLA
+        if kv_cache_dtype != target_cache_dtype:
             assert cache_config is not None
-            cache_config.cache_dtype = "fp8_ds_mla"
-            kv_cache_dtype = "fp8_ds_mla"
-            logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
+            cache_config.cache_dtype = target_cache_dtype
+            kv_cache_dtype = target_cache_dtype
+            if self.use_fp8_cache:
+                logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
+            else:
+                logger.info_once(
+                    "Native FP8 compute unavailable on this platform; using "
+                    "the DeepSeek V4 BF16 KV cache fallback (~2x the fp8_ds_mla "
+                    "page size)."
+                )
 
         self.kv_cache_dtype = kv_cache_dtype
 
@@ -495,7 +505,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             # fp8_ds_mla page payload (584B/token) rounded up to 576B
             # alignment; the Triton dequant kernel reads at the same stride.
-            alignment=576,
+            # The BF16 fallback slot (1024B) needs no extra alignment.
+            alignment=576 if self.use_fp8_cache else None,
             model_version="deepseek_v4",
         )
 
@@ -746,6 +757,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
@@ -754,8 +766,8 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             compress_ratio=self.compress_ratio,
             # Match the fp8_ds_mla page alignment so the indexer's K cache
             # and the compressor's state pages share contiguous physical
-            # blocks.
-            alignment=576,
+            # blocks. The BF16 fallback slot needs no extra alignment.
+            alignment=576 if uses_fp8_ds_mla_layout else None,
         )
 
     def forward(self): ...
@@ -820,8 +832,15 @@ class DeepseekV4Indexer(nn.Module):
         )
 
         assert cache_config is not None
-        # FP8 layout: 128 fp8 + 4 fp32 scale = 132 bytes/head_dim.
-        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+        self.use_fp8_cache = kv_cache_uses_fp8()
+        if self.use_fp8_cache:
+            # FP8 layout: 128 fp8 + 4 fp32 scale = 132 bytes/head_dim.
+            k_cache_head_dim = (
+                self.head_dim + self.head_dim // self.quant_block_size * 4
+            )
+        else:
+            # BF16 fallback: 128 bf16 = 256 bytes/head_dim, no scale.
+            k_cache_head_dim = self.head_dim * 2
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
             dtype=torch.uint8,

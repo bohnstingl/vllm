@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    kv_cache_uses_fp8,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
@@ -23,6 +26,7 @@ def _indexer_k_quant_and_cache_kernel(
     HEAD_TILE_SIZE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, head_dim)
@@ -45,16 +49,7 @@ def _indexer_k_quant_and_cache_kernel(
     tile_block_id = block_offset // BLOCK_TILE_SIZE
     tile_block_offset = block_offset % BLOCK_TILE_SIZE
     val = tl.load(src_ptr + offset)
-    amax = tl.max(val.abs(), axis=-1).to(tl.float32)
-    if IS_FNUZ:
-        scale = tl.maximum(1e-4, amax) / 224.0
-    else:
-        scale = tl.maximum(1e-4, amax) / 448.0
 
-    if USE_UE8M0:
-        scale = tl.exp2(tl.ceil(tl.log2(scale)))
-
-    fp8_val = (val.to(tl.float32) / scale).to(kv_cache_ptr.type.element_ty)
     if LAYOUT == "SHUFFLE":
         dst_ptr = (
             kv_cache_ptr
@@ -66,20 +61,44 @@ def _indexer_k_quant_and_cache_kernel(
         dst_ptr = (
             kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
         )
-    tl.store(dst_ptr + tile_store_offset, fp8_val)
-    dst_scale_ptr = kv_cache_scale_ptr + block_id * kv_cache_scale_stride + block_offset
-    tl.store(dst_scale_ptr, scale)
+
+    # NOTE: the fp8 branch must live under ``else`` (not after an early
+    # return): ``.to(element_ty)`` where element_ty is fp8e4nv fails to
+    # compile on sm_80 unless it is behind a constexpr guard.
+    if not USE_FP8:
+        # BF16 fallback: store the raw bf16 values, no quant/scale.
+        tl.store(dst_ptr + tile_store_offset, val.to(kv_cache_ptr.type.element_ty))
+    else:
+        amax = tl.max(val.abs(), axis=-1).to(tl.float32)
+        if IS_FNUZ:
+            scale = tl.maximum(1e-4, amax) / 224.0
+        else:
+            scale = tl.maximum(1e-4, amax) / 448.0
+
+        if USE_UE8M0:
+            scale = tl.exp2(tl.ceil(tl.log2(scale)))
+
+        fp8_val = (val.to(tl.float32) / scale).to(kv_cache_ptr.type.element_ty)
+        tl.store(dst_ptr + tile_store_offset, fp8_val)
+        dst_scale_ptr = (
+            kv_cache_scale_ptr + block_id * kv_cache_scale_stride + block_offset
+        )
+        tl.store(dst_scale_ptr, scale)
 
 
 def indexer_k_quant_and_cache_triton(
     k: torch.Tensor,
-    kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4] (fp8) or *2 (bf16)
     slot_mapping: torch.Tensor,
     quant_block_size,
     scale_fmt,
     block_tile_size=16,
     head_tile_size=16,
+    use_fp8: bool | None = None,
 ):
+    if use_fp8 is None:
+        use_fp8 = kv_cache_uses_fp8()
+
     num_blocks = kv_cache.shape[0]
     head_dim = k.shape[-1]
     num_tokens = slot_mapping.shape[0]
@@ -87,10 +106,17 @@ def indexer_k_quant_and_cache_triton(
     # In real layout, we store the first portion as kv cache value
     # and second portion as kv cache scale
     kv_cache = kv_cache.view(num_blocks, -1)
-    fp8_dtype = current_platform.fp8_dtype()
-    kv_cache_value = kv_cache[:, : block_size * head_dim].view(fp8_dtype)
-    kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
-    head_tile_size = head_tile_size // kv_cache.element_size()
+    if use_fp8:
+        fp8_dtype = current_platform.fp8_dtype()
+        kv_cache_value = kv_cache[:, : block_size * head_dim].view(fp8_dtype)
+        kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
+        is_fnuz = fp8_dtype == torch.float8_e4m3fnuz
+    else:
+        # BF16 fallback: value region is [block_size * head_dim] bf16, no scale.
+        kv_cache_value = kv_cache[:, : block_size * head_dim * 2].view(torch.bfloat16)
+        kv_cache_scale = kv_cache_value  # unused by the kernel in bf16 mode
+        is_fnuz = False
+    head_tile_size = head_tile_size // kv_cache_value.element_size()
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
     grid = (num_tokens,)
     _indexer_k_quant_and_cache_kernel[grid](
@@ -106,8 +132,9 @@ def indexer_k_quant_and_cache_triton(
         layout,
         block_tile_size,
         head_tile_size,
-        IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
+        IS_FNUZ=is_fnuz,
         USE_UE8M0=scale_fmt == "ue8m0",
+        USE_FP8=use_fp8,
     )
 
 
@@ -133,6 +160,7 @@ def _cp_gather_indexer_quant_cache_kernel(
     NUM_BATCHES: tl.constexpr,
     BLOCK_TABLE_WIDTH: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, HEAD_DIM)
@@ -176,13 +204,14 @@ def _cp_gather_indexer_quant_cache_kernel(
         src_cache_offset = (
             safe_block_id * kv_cache_stride + safe_block_offset * HEAD_DIM
         )
-    src_scale_offset = safe_block_id * kv_cache_scale_stride + safe_block_offset
     dst_offset = tid * HEAD_DIM
-    src_scale_ptr = kv_cache_scale_ptr + src_scale_offset
     src_cache_ptr = kv_cache_ptr + src_cache_offset
     dst_k_ptr = k_fp8_ptr + dst_offset
-    scale_val = tl.load(src_scale_ptr, mask=valid_block, other=0.0)
-    tl.store(k_scale_ptr + tid, scale_val)
+    if USE_FP8:
+        src_scale_offset = safe_block_id * kv_cache_scale_stride + safe_block_offset
+        src_scale_ptr = kv_cache_scale_ptr + src_scale_offset
+        scale_val = tl.load(src_scale_ptr, mask=valid_block, other=0.0)
+        tl.store(k_scale_ptr + tid, scale_val)
     if LAYOUT == "SHUFFLE":
         tiled_src_offset = (
             offset // HEAD_TILE_SIZE * HEAD_TILE_SIZE * BLOCK_TILE_SIZE
@@ -195,7 +224,7 @@ def _cp_gather_indexer_quant_cache_kernel(
 
 
 def cp_gather_indexer_k_quant_cache_triton(
-    k_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4]
+    k_cache: torch.Tensor,  # [num_blocks, block_size, head_dim + 4] (fp8) or *2 (bf16)
     k_fp8: torch.Tensor,
     k_fp8_scale: torch.Tensor,
     block_table: torch.Tensor,
@@ -203,7 +232,11 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
+    use_fp8: bool | None = None,
 ):
+    if use_fp8 is None:
+        use_fp8 = kv_cache_uses_fp8()
+
     num_tokens = k_fp8.size(0)
     block_size = k_cache.size(1)
     block_table_stride = block_table.stride(0)
@@ -211,11 +244,19 @@ def cp_gather_indexer_k_quant_cache_triton(
     num_blocks = k_cache.shape[0]
     # we assume the kv cache already been split to 2 portion
     k_cache = k_cache.view(num_blocks, -1)
-    fp8_dtype = current_platform.fp8_dtype()
-    k_cache_value = k_cache[:, : block_size * head_dim].view(fp8_dtype)
-    k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
+    if use_fp8:
+        fp8_dtype = current_platform.fp8_dtype()
+        k_cache_value = k_cache[:, : block_size * head_dim].view(fp8_dtype)
+        k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
+        k_fp8_scale = k_fp8_scale.view(torch.float32)
+    else:
+        # BF16 fallback: value region only, output is bf16.
+        k_cache_value = k_cache[:, : block_size * head_dim * 2].view(torch.bfloat16)
+        k_cache_scale = k_cache_value  # unused by the kernel in bf16 mode
+    # HEAD_TILE_SIZE is in elements for a 16-byte tile; must match the value
+    # dtype used at insert (fp8: 16 elems, bf16: 8 elems).
+    head_tile_size = head_tile_size // k_cache_value.element_size()
     grid = (num_tokens,)
-    k_fp8_scale = k_fp8_scale.view(torch.float32)
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
     _cp_gather_indexer_quant_cache_kernel[grid](
         k_cache_value,
@@ -237,4 +278,5 @@ def cp_gather_indexer_k_quant_cache_triton(
         cu_seqlen.shape[0] - 1,
         block_table.shape[1],
         num_blocks,
+        USE_FP8=use_fp8,
     )
