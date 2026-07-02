@@ -236,20 +236,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
-        if not self.fp8_compute:
-            # Dequant FP8 experts to BF16 once; the BF16 Triton MoE runs
-            # with no FP8 compute. Replace weights with BF16 and drop the
-            # FP8 scales so ``get_fused_moe_quant_config`` returns the
-            # unquantized config.
-            w13 = self._dequant_expert_weight(w13, w13_scale, layer.orig_dtype)
-            w2 = self._dequant_expert_weight(w2, w2_scale, layer.orig_dtype)
-            replace_parameter(layer, "w13_weight", w13)
-            replace_parameter(layer, "w2_weight", w2)
-            self._setup_kernel(
-                layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
-            )
-            return
-
+        # On non-FP8-compute HW (e.g. sm_80) the weights stay FP8-resident
+        # and are dequantized to BF16 per-layer at runtime in ``apply`` (see
+        # below). We keep the FP8 weights and scales as-is here; the kernel is
+        # still built with the unquantized (biased) config via
+        # ``get_fused_moe_quant_config`` so the grouped GEMM runs in BF16 and
+        # never lowers FP8 in Triton. This avoids the ~2x memory blowup of a
+        # load-time BF16 dequant, which left no HBM for the KV cache.
         self._setup_kernel(
             layer, w13, w2, w13_scale, w2_scale, w13_input_scale, w2_input_scale
         )
@@ -322,10 +315,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.moe_kernel is not None
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        if not self.fp8_compute:
+            # FP8 weights are resident; dequant this layer to BF16 on the
+            # fly. Transients free after the call, so peak HBM stays at the
+            # FP8 weight footprint + one layer's BF16 experts (verified
+            # cudagraph-safe: this MoE op body runs inside a piecewise
+            # cudagraph region and the allocation is replay-stable here).
+            w13 = self._dequant_expert_weight(
+                w13, getattr(layer, f"w13_{self.weight_scale_name}"), layer.orig_dtype
+            )
+            w2 = self._dequant_expert_weight(
+                w2, getattr(layer, f"w2_{self.weight_scale_name}"), layer.orig_dtype
+            )
         return self.moe_kernel.apply(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            w13,
+            w2,
             topk_weights,
             topk_ids,
             activation=layer.activation,
