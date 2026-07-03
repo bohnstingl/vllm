@@ -19,10 +19,7 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
             return False, "only CUDA-alike and XPU devices are supported."
         if not current_platform.supports_fp8():
-            # Triton has no fp8e4nv support on pre-Ada (sm_80); the
-            # block-scaled quant/GEMM would fail to compile. Fall back to
-            # the BF16-dequant kernel instead.
-            return False, "requires native FP8 compute (e.g. sm_89+)."
+            return False, "requires native FP8 compute (e.g. CUDA sm_89+)."
         return True, None
 
     def apply_block_scaled_mm(

@@ -147,7 +147,7 @@ def fused_indexer_q_rope_quant(
     index_weights: torch.Tensor,
     index_weights_softmax_scale: float,
     index_weights_head_scale: float,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused RoPE + FP8 quantize Q for the sparse indexer.
 
@@ -161,7 +161,7 @@ def fused_indexer_q_rope_quant(
     assert index_q.ndim == 3
     assert index_q_cos_sin_cache.ndim == 2
 
-    if use_fp8 is None:
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     num_tokens = positions.shape[0]

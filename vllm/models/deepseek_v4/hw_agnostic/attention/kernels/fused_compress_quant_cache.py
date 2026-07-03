@@ -34,14 +34,14 @@ def compress_norm_rope_store_triton(
     quant_block: int,
     token_stride: int,
     scale_dim: int,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ) -> None:
     """Launch the fused compress+norm+RoPE+insert path.
 
     Picks the sparse-attn (head=512) or indexer (head=128) kernel based on
     ``head_dim``. Identical launch signature for both.
     """
-    if use_fp8 is None:
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     if head_dim == 512:
@@ -447,14 +447,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)  # fp32
 
-    # NOTE: the fp8 branch must live under ``else`` (not after an early
-    # return): a top-level ``tl.float8e4nv`` fails to compile on sm_80.
-    if not USE_FP8:
-        # BF16 fallback: store the 128 rotated values as bf16, no scale.
-        # ``fp8_ptr`` addresses a 256B bf16 token slot here.
-        bf16_ptr = fp8_ptr.to(tl.pointer_type(tl.bfloat16))
-        tl.store(bf16_ptr + block, result.to(tl.bfloat16), mask=mask)
-    else:
+    if USE_FP8:
         # ── FP8 UE8M0 quant: single block, flat reduction ────────────────
         tl.static_assert(
             TRITON_BLOCK_SIZE == QUANT_BLOCK,
@@ -479,3 +472,8 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         # Single float32 scale
         scale_val = tl.exp2(exponent)
         tl.store(scale_ptr.to(tl.pointer_type(tl.float32)), scale_val)
+    else:
+        # BF16 fallback: store the 128 rotated values as bf16, no scale.
+        # ``fp8_ptr`` addresses a 256B bf16 token slot here.
+        bf16_ptr = fp8_ptr.to(tl.pointer_type(tl.bfloat16))
+        tl.store(bf16_ptr + block, result.to(tl.bfloat16), mask=mask)

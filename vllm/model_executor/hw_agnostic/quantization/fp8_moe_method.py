@@ -62,12 +62,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "weight_scale_inv" if self.block_quant else "weight_scale"
         )
         self.experts_cls = TritonExperts
-        # On platforms without native FP8 compute (e.g. sm_80), the FP8
-        # activation quant + FP8 tensor-core GEMM cannot run. Dequant the
-        # expert weights to BF16 and run the unquantized (BF16) Triton MoE
-        # instead (at runtime by default; at load time if the platform sets
-        # ``moe_dequant_at_load``).
         self.fp8_compute = current_platform.supports_fp8()
+        # If fp8 compute is not supported, attribute determining 
+        # whether the dequantization from fp8 to bf16
+        # is done at runtime or at load time.
         self._moe_dequant_at_load = getattr(
             current_platform, "moe_dequant_at_load", False
         )
@@ -243,16 +241,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
-        # On non-FP8-compute HW (e.g. sm_80) the FP8 activation quant + GEMM
-        # cannot run, so the experts are dequantized to BF16 and the kernel is
-        # built with the unquantized (biased) config via
-        # ``get_fused_moe_quant_config`` (BF16 grouped GEMM, no FP8 lowered in
-        # Triton). By default the dequant happens per-layer at RUNTIME in
-        # ``apply`` (weights stay FP8-resident -- avoids the ~2x memory blowup
-        # that left no HBM for the KV cache). A platform may set
-        # ``moe_dequant_at_load`` to instead dequant ONCE here, freeing the FP8
-        # copy; ``apply`` then auto-detects the BF16 weights and skips the
-        # runtime dequant.
+        # If fp8 compute is not supported and dequantization at load time is selected,
+        # perform the dequantization once here.
         if not self.fp8_compute and self._moe_dequant_at_load:
             w13 = self._dequant_expert_weight(w13, w13_scale, layer.orig_dtype)
             w2 = self._dequant_expert_weight(w2, w2_scale, layer.orig_dtype)
@@ -328,16 +318,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert self.moe_kernel is not None
         w13 = layer.w13_weight
         w2 = layer.w2_weight
-        # Runtime dequant path: only when the weights are still FP8-resident
-        # (element_size == 1). If ``moe_dequant_at_load`` already dequantized
-        # them to BF16 (>= 2 bytes) at load time, skip -- the two paths are
-        # mutually exclusive with no extra flag threaded through the forward.
-        if not self.fp8_compute and w13.element_size() == 1:
-            # Dequant this layer to BF16 on the fly. Transients free after the
-            # call, so peak HBM stays at the FP8 weight footprint + one layer's
-            # BF16 experts (verified cudagraph-safe: this MoE op body runs
-            # inside a piecewise cudagraph region and the allocation is
-            # replay-stable here).
+        
+        if not self.fp8_compute and not self._moe_dequant_at_load:
+            # Runtime dequant path in case self._moe_dequant_at_load is not selected.
             w13 = self._dequant_expert_weight(
                 w13, getattr(layer, f"w13_{self.weight_scale_name}"), layer.orig_dtype
             )

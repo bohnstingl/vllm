@@ -57,18 +57,11 @@ def quantize_and_insert_k_kernel(
     # Each token's data is at offset pos_in_block * token_data_size
     token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
 
-    if not USE_FP8:
-        # BF16 fallback: store all 512 values as bf16, no quant, no scale.
-        # NOTE: the fp8 branch below must live under ``else`` (not after an
-        # early return): Triton compiles every statement at module scope, so
-        # a top-level ``tl.float8e4nv`` would still fail on sm_80. Only a
-        # constexpr-guarded branch is dead-code-eliminated.
-        bf16_out_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
-        for i in tl.static_range(input_dim // 16):
-            chunk_offsets = i * 16 + tl.arange(0, 16)
-            vals = tl.load(input_row_ptr + chunk_offsets)
-            tl.store(bf16_out_ptr + chunk_offsets, vals)
-    else:
+    # NOTE: both layouts must be constexpr-guarded arms of this ``if`` (not an
+    # early return + fall-through): Triton compiles every statement in the
+    # body, so a ``tl.float8e4nv`` outside a ``USE_FP8`` guard would still fail
+    # to compile on sm_80. Only the dead branch is eliminated.
+    if USE_FP8:
         # Scale pointer: scales are stored after ALL token data in the block
         # Scale for this token is at offset (64 * 576) + pos_in_block * 8
         token_scale_ptr = (
@@ -134,6 +127,13 @@ def quantize_and_insert_k_kernel(
             chunk_offsets = i * 16 + tl.arange(0, 16)
             bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
             tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+    else:
+        # BF16 fallback: store all 512 values as bf16, no quant, no scale.
+        bf16_out_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+        for i in tl.static_range(input_dim // 16):
+            chunk_offsets = i * 16 + tl.arange(0, 16)
+            vals = tl.load(input_row_ptr + chunk_offsets)
+            tl.store(bf16_out_ptr + chunk_offsets, vals)
 
 
 def quantize_and_insert_k_cache(
@@ -142,7 +142,7 @@ def quantize_and_insert_k_cache(
     slot_mapping: torch.Tensor,  # [num_tokens] int64
     block_size: int = 64,
     is_ue8m0: bool = True,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ):
     assert k.dim() == 2 and k.shape[1] == 512, (
         f"K must be [num_tokens, 512], got {k.shape}"
@@ -150,7 +150,10 @@ def quantize_and_insert_k_cache(
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
 
-    if use_fp8 is None:
+    # ``True`` (default) means "use fp8 if the platform supports native fp8
+    # compute"; resolve against the platform gate. ``False`` is a hard bf16
+    # override (e.g. from a caller that already decided the layout).
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
@@ -245,17 +248,11 @@ def _dequantize_and_gather_k_kernel(
         # Output pointer for this token (flattened)
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
-        # NOTE: the fp8 branch must live under ``else`` (not after a
-        # ``continue``): Triton compiles the whole loop body, so a
-        # ``tl.float8e4nv`` outside a constexpr guard still fails on sm_80.
-        if not USE_FP8:
-            # BF16 fallback: copy all 512 bf16 values directly.
-            bf16_cache_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
-            for j in tl.static_range(output_dim // 16):
-                chunk_offsets = j * 16 + tl.arange(0, 16)
-                vals = tl.load(bf16_cache_ptr + chunk_offsets)
-                tl.store(output_row_ptr + chunk_offsets, vals)
-        else:
+        # NOTE: both layouts must be constexpr-guarded arms of this ``if`` (not
+        # an early ``continue`` + fall-through): Triton compiles the whole loop
+        # body, so a ``tl.float8e4nv`` outside a ``USE_FP8`` guard still fails
+        # on sm_80. Only the dead branch is eliminated.
+        if USE_FP8:
             # Scale pointer: after all token data
             token_scale_ptr = (
                 cache_block_ptr
@@ -310,6 +307,13 @@ def _dequantize_and_gather_k_kernel(
                 chunk_offsets = j * 16 + tl.arange(0, 16)
                 bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
                 tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+        else:
+            # BF16 fallback: copy all 512 bf16 values directly.
+            bf16_cache_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+            for j in tl.static_range(output_dim // 16):
+                chunk_offsets = j * 16 + tl.arange(0, 16)
+                vals = tl.load(bf16_cache_ptr + chunk_offsets)
+                tl.store(output_row_ptr + chunk_offsets, vals)
 
 
 def dequantize_and_gather_k_cache_triton(
@@ -325,9 +329,12 @@ def dequantize_and_gather_k_cache_triton(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ) -> None:
-    if use_fp8 is None:
+    # ``True`` (default) means "use fp8 if the platform supports native fp8
+    # compute"; resolve against the platform gate. ``False`` is a hard bf16
+    # override (e.g. from a caller that already decided the layout).
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     TOKEN_FP8_DIM = 448

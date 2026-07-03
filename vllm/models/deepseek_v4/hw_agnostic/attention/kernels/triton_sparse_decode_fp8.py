@@ -80,18 +80,7 @@ def _dequant_gather_slots_kernel(
     # Token data: at offset pos_in_block * token_data_size within block
     token_data_ptr = block_base + pos_in_block * token_data_size
 
-    # NOTE: the fp8 branch must live under ``else`` (not after an early
-    # return): Triton compiles the whole body, so a top-level
-    # ``tl.float8e4nv`` still fails on sm_80. Only the constexpr-guarded
-    # branch is dead-code-eliminated.
-    if not USE_FP8:
-        # BF16 fallback: copy all 512 bf16 values directly.
-        bf16_src_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
-        for j in tl.static_range(output_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            vals = tl.load(bf16_src_ptr + chunk_offsets)
-            tl.store(out_row_ptr + chunk_offsets, vals)
-    else:
+    if USE_FP8:
         # Scale: after all token data, at offset
         # cache_block_size * token_data_size + pos_in_block * scale_dim
         scale_region_offset = tl.cast(cache_block_size, tl.int64) * token_data_size
@@ -125,6 +114,13 @@ def _dequant_gather_slots_kernel(
             chunk_offsets = j * 16 + tl.arange(0, 16)
             bf16_vals = tl.load(bf16_src_ptr + chunk_offsets)
             tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+    else:
+        # BF16 fallback: copy all 512 bf16 values directly.
+        bf16_src_ptr = token_data_ptr.to(tl.pointer_type(tl.bfloat16))
+        for j in tl.static_range(output_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            vals = tl.load(bf16_src_ptr + chunk_offsets)
+            tl.store(out_row_ptr + chunk_offsets, vals)
 
 
 def dequant_gather_slots(
@@ -132,14 +128,14 @@ def dequant_gather_slots(
     cache: torch.Tensor,  # [num_blocks, block_size, head_bytes] uint8
     indices: torch.Tensor,  # [total_slots] int32, global slot IDs
     cache_block_size: int,  # block_size for this cache
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ) -> None:
     """Dequantize FP8 UE8M0 pages at scattered slot indices into bf16."""
     total_slots = indices.shape[0]
     if total_slots == 0:
         return
 
-    if use_fp8 is None:
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     block_stride = cache.stride(0)

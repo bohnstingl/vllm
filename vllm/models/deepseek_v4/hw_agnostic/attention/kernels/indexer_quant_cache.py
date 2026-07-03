@@ -62,13 +62,7 @@ def _indexer_k_quant_and_cache_kernel(
             kv_cache_ptr + block_id * kv_cache_value_stride + block_offset * head_dim
         )
 
-    # NOTE: the fp8 branch must live under ``else`` (not after an early
-    # return): ``.to(element_ty)`` where element_ty is fp8e4nv fails to
-    # compile on sm_80 unless it is behind a constexpr guard.
-    if not USE_FP8:
-        # BF16 fallback: store the raw bf16 values, no quant/scale.
-        tl.store(dst_ptr + tile_store_offset, val.to(kv_cache_ptr.type.element_ty))
-    else:
+    if USE_FP8:
         amax = tl.max(val.abs(), axis=-1).to(tl.float32)
         if IS_FNUZ:
             scale = tl.maximum(1e-4, amax) / 224.0
@@ -84,6 +78,9 @@ def _indexer_k_quant_and_cache_kernel(
             kv_cache_scale_ptr + block_id * kv_cache_scale_stride + block_offset
         )
         tl.store(dst_scale_ptr, scale)
+    else:
+        # BF16 fallback: store the raw bf16 values, no quant/scale.
+        tl.store(dst_ptr + tile_store_offset, val.to(kv_cache_ptr.type.element_ty))
 
 
 def indexer_k_quant_and_cache_triton(
@@ -94,9 +91,12 @@ def indexer_k_quant_and_cache_triton(
     scale_fmt,
     block_tile_size=16,
     head_tile_size=16,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ):
-    if use_fp8 is None:
+    # ``True`` (default) means "use fp8 if the platform supports native fp8
+    # compute"; resolve against the platform gate. ``False`` is a hard bf16
+    # override (e.g. from a caller that already decided the layout).
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     num_blocks = kv_cache.shape[0]
@@ -232,9 +232,9 @@ def cp_gather_indexer_k_quant_cache_triton(
     token_to_seq: torch.Tensor,
     block_tile_size: int = 16,
     head_tile_size: int = 16,
-    use_fp8: bool | None = None,
+    use_fp8: bool = True,
 ):
-    if use_fp8 is None:
+    if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
     num_tokens = k_fp8.size(0)
