@@ -150,9 +150,6 @@ def quantize_and_insert_k_cache(
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
 
-    # ``True`` (default) means "use fp8 if the platform supports native fp8
-    # compute"; resolve against the platform gate. ``False`` is a hard bf16
-    # override (e.g. from a caller that already decided the layout).
     if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 
@@ -248,10 +245,6 @@ def _dequantize_and_gather_k_kernel(
         # Output pointer for this token (flattened)
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
-        # NOTE: both layouts must be constexpr-guarded arms of this ``if`` (not
-        # an early ``continue`` + fall-through): Triton compiles the whole loop
-        # body, so a ``tl.float8e4nv`` outside a ``USE_FP8`` guard still fails
-        # on sm_80. Only the dead branch is eliminated.
         if USE_FP8:
             # Scale pointer: after all token data
             token_scale_ptr = (
@@ -331,9 +324,6 @@ def dequantize_and_gather_k_cache_triton(
     offset: int,
     use_fp8: bool = True,
 ) -> None:
-    # ``True`` (default) means "use fp8 if the platform supports native fp8
-    # compute"; resolve against the platform gate. ``False`` is a hard bf16
-    # override (e.g. from a caller that already decided the layout).
     if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 

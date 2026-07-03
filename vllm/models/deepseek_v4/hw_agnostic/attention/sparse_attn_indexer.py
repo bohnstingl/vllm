@@ -18,7 +18,7 @@ from vllm.models.deepseek_v4.hw_agnostic.attention.indexer import (
 )
 from vllm.models.deepseek_v4.hw_agnostic.attention.kernels.fp8_logits_torch import (
     fp8_mqa_logits_torch,
-    fp8_paged_mqa_logits_torch,
+    paged_mqa_logits_torch,
 )
 from vllm.models.deepseek_v4.hw_agnostic.attention.kernels.indexer_quant_cache import (
     cp_gather_indexer_k_quant_cache_triton,
@@ -224,7 +224,7 @@ def dsv4_sparse_attn_indexer(
         num_padded_tokens = batch_size * next_n
         seq_lens = decode_metadata.seq_lens[:batch_size]
 
-        logits = fp8_paged_mqa_logits_torch(
+        logits = paged_mqa_logits_torch(
             padded_q_quant_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],

@@ -2,17 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """BF16-dequant fallback for block-scaled FP8 linear layers.
 
-On platforms without native FP8 compute (e.g. NVIDIA Ampere / sm_80,
-where Triton has no ``fp8e4nv`` support) the block-scaled FP8 GEMM and
+On platforms without native FP8 compute the block-scaled FP8 GEMM and
 its activation quant cannot run. This kernel instead dequantizes the
 block-scaled FP8 weights to BF16 once at load time and runs a plain BF16
-GEMM against the (un-quantized) BF16 activations. It is model-independent
-and selected purely on the platform capability.
+GEMM against the (un-quantized) BF16 activations.
+It is selected purely on the platform capability.
 
-OOT override seam: an out-of-tree platform forces this fp8->bf16
-block-scaled fallback by overriding ``Platform.supports_fp8()`` (return
-False). A platform needing a different fallback GEMM prepends its own
-kernel under its ``PlatformEnum`` in ``_POSSIBLE_FP8_BLOCK_KERNELS``.
 """
 
 import torch
@@ -30,8 +25,7 @@ from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
 class Bf16DequantFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     """Dequant-to-BF16 fallback for block-scaled FP8 linear on non-FP8 HW."""
 
-    # Activations stay BF16 -- no FP8 activation quant (which would also
-    # fail to compile in Triton on sm_80).
+    # Activations stay BF16 -- no FP8 activation quant
     apply_input_quant = False
 
     @classmethod
@@ -44,10 +38,6 @@ class Bf16DequantFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        # Base class transposes/normalizes the block-scaled fp8 weight. Then
-        # dequant to BF16 ONCE here (eager) so ``apply_weights`` never reads
-        # fp8 inside the torch.compile region -- Triton can't lower fp8e4nv
-        # on sm_80, even for a read.
         super().process_weights_after_loading(layer)
         params = self._get_layer_params(layer)
         weight = params.weight

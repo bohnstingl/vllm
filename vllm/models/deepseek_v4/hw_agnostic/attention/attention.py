@@ -167,7 +167,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # Sparse-MLA cache slot size. FP8 packs 448 fp8 NoPE + 64 bf16 RoPE
         # + 8B UE8M0 scale; the BF16 fallback (non-FP8 HW) stores all 512
-        # elements as bf16 with no scale block. See ``_fp8_support``.
+        # elements as bf16 with no scale block.
         head_bytes = mla_head_bytes()
 
         assert cache_config is not None
@@ -462,9 +462,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         assert issubclass(self.get_attn_backend(), DeepseekV4HWAgnosticBackend)
         self.use_fp8_cache = kv_cache_uses_fp8()
-        # Coerce to the V4 sparse-MLA layout. FP8 HW uses the packed
-        # ``fp8_ds_mla`` layout (584B/token, UE8M0-block FP8); non-FP8 HW
-        # (e.g. sm_80) falls back to an all-BF16 slot with the same paged
+        # Coerce to the V4 sparse-MLA layout.
+        # FP8 HW uses the packed ``fp8_ds_mla`` layout (584B/token, UE8M0-block FP8).
+        # non-FP8 HW falls back to an all-BF16 slot with the same paged
         # geometry (``DSV4_BF16_DS_MLA``, 1024B/token, no scale block).
         target_cache_dtype = "fp8_ds_mla" if self.use_fp8_cache else DSV4_BF16_DS_MLA
         if kv_cache_dtype != target_cache_dtype:

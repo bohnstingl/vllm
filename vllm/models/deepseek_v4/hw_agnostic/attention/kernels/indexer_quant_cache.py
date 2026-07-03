@@ -93,9 +93,6 @@ def indexer_k_quant_and_cache_triton(
     head_tile_size=16,
     use_fp8: bool = True,
 ):
-    # ``True`` (default) means "use fp8 if the platform supports native fp8
-    # compute"; resolve against the platform gate. ``False`` is a hard bf16
-    # override (e.g. from a caller that already decided the layout).
     if use_fp8 is True:
         use_fp8 = kv_cache_uses_fp8()
 

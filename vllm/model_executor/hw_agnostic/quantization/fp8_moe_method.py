@@ -63,7 +63,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         self.experts_cls = TritonExperts
         self.fp8_compute = current_platform.supports_fp8()
-        # If fp8 compute is not supported, attribute determining 
+        # If fp8 compute is not supported, attribute determining
         # whether the dequantization from fp8 to bf16
         # is done at runtime or at load time.
         self._moe_dequant_at_load = getattr(
@@ -318,7 +318,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert self.moe_kernel is not None
         w13 = layer.w13_weight
         w2 = layer.w2_weight
-        
+
         if not self.fp8_compute and not self._moe_dequant_at_load:
             # Runtime dequant path in case self._moe_dequant_at_load is not selected.
             w13 = self._dequant_expert_weight(

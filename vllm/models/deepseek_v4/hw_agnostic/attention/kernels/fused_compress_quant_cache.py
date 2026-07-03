@@ -283,13 +283,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
 
     # Store rotated rope portion as bf16 into the cache's bf16 area.
-    # FP8 slot: RoPE bf16 region starts at byte offset NOPE_HEAD_DIM (=448),
-    # i.e. right after the fp8 bytes. BF16 slot: the whole token is bf16, so
-    # the RoPE region starts at bf16-element index NOPE_HEAD_DIM.
     rope_local = block - NOPE_HEAD_DIM
     if USE_FP8:
         bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
     else:
+        # BF16 slot: the whole token is bf16, so
+        # the RoPE region starts at bf16-element index NOPE_HEAD_DIM.
         bf16_ptr = fp8_ptr.to(tl.pointer_type(tl.bfloat16)) + NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
     tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
