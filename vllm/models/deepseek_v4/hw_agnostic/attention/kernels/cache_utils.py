@@ -309,9 +309,7 @@ def _dequantize_and_gather_k_kernel(
             for j in tl.static_range(bf16_dim // 16):
                 chunk_offsets = j * 16 + tl.arange(0, 16)
                 bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-                tl.store(
-                    output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals
-                )
+                tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
 
 
 def dequantize_and_gather_k_cache_triton(

@@ -21,6 +21,11 @@ from vllm.model_executor.hw_agnostic.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    BF16_TOKEN_BYTES,
+    FP8_TOKEN_BYTES,
+    kv_cache_uses_fp8,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention._metadata_utils import (
     split_decodes_and_prefills,
 )
@@ -55,8 +60,9 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # fp8_ds_mla pages carry 584B of payload per token (448B fp8 NoPE
         # + 128B bf16 RoPE + 8B UE8M0 scale); padded to 576B alignment.
-        # The Triton dequant kernel reads pages at the same stride.
-        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
+        # The Triton dequant kernel reads pages at the same stride. The
+        # BF16 fallback slot needs no extra alignment.
+        uses_fp8 = kv_cache_uses_fp8()
         return SlidingWindowMLASpec(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -64,7 +70,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.window_size,
             cache_dtype_str=self.cache_config.cache_dtype,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            alignment=576 if uses_fp8 else None,
             model_version="deepseek_v4",
         )
 
@@ -104,10 +110,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
         assert num_kv_heads == 1
         if cache_dtype_str == "fp8_ds_mla":
             # 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
-            return (num_blocks, block_size, 584)
+            return (num_blocks, block_size, FP8_TOKEN_BYTES)
         if cache_dtype_str == "bf16_ds_mla":
             # 1024B per token (512 bf16 values, no scale).
-            return (num_blocks, block_size, 1024)
+            return (num_blocks, block_size, BF16_TOKEN_BYTES)
         return (num_blocks, block_size, head_size)
 
     @staticmethod

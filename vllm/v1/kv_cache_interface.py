@@ -380,7 +380,10 @@ class MLAAttentionSpec(FullAttentionSpec):
     def real_page_size_bytes(self) -> int:
         if self.cache_dtype_str == "bf16_ds_mla":
             # DeepseekV4 BF16 fallback (non-FP8 HW): all 512 values stored as
-            # bf16, no scale block => 1024B per token.
+            # bf16, no scale block => 1024B per token. cache_dtype_str is the
+            # serialized form of the platform's supports_fp8() decision (set
+            # in DeepseekV4MLAAttention.__init__); this generic code
+            # dispatches on the string, it never re-reads the platform.
             assert self.model_version == "deepseek_v4"
             return self.storage_block_size * 1024
         if self.cache_dtype_str == "fp8_ds_mla":
@@ -620,6 +623,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and self.cache_dtype_str == "bf16_ds_mla"
         ):
             # DeepseekV4 BF16 fallback: 512 bf16 values = 1024B per token.
+            # cache_dtype_str is the serialized form of the platform's
+            # supports_fp8() decision (set in DeepseekV4MLAAttention.__init__).
             return self.storage_block_size * 1024
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"

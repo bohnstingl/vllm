@@ -933,24 +933,15 @@ class Platform:
     def supports_fp8(cls) -> bool:
         """
         Returns whether the current platform supports FP8 types.
+
+        On CUDA this is ``has_device_capability(89)``, i.e. it already means
+        "can run native FP8 arithmetic/kernels" (False on pre-Ada / sm_80,
+        where Triton has no ``fp8e4nv`` support), not merely "can hold an FP8
+        tensor via eager emulation". Callers that must fall back to BF16 when
+        native FP8 compute is unavailable gate on this; out-of-tree platforms
+        override it to force the fallback.
         """
         return False
-
-    @classmethod
-    def supports_fp8_compute(cls) -> bool:
-        """
-        Returns whether the platform can run FP8 arithmetic/kernels (not
-        just represent the dtype).
-
-        Some platforms can hold an FP8 tensor via eager emulation but cannot
-        compile FP8 conversions in Triton or run FP8 tensor-core GEMMs -- e.g.
-        NVIDIA Ampere (sm_80), where Triton has no ``fp8e4nv`` support.
-        Callers that need to fall back to BF16 when native FP8 compute is
-        unavailable should gate on this rather than on the mere existence of
-        the dtype. Defaults to ``supports_fp8()``; out-of-tree platforms may
-        override.
-        """
-        return cls.supports_fp8()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:

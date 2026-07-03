@@ -32,6 +32,32 @@ def _get_fp8_min_max() -> tuple[float, float]:
     return finfo.min, finfo.max
 
 
+def block_dequantize_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: tuple[int, int],
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize a block-scaled FP8 weight to ``out_dtype``.
+
+    The last two dims of ``weight`` are ``(N, K)``; any leading dims (e.g. a
+    stacked expert dim ``E``) are preserved. ``weight_scale`` carries one
+    scalar per ``block_n x block_k`` tile, i.e. its last two dims are
+    ``(cdiv(N, block_n), cdiv(K, block_k))`` with matching leading dims.
+    Used by both the linear (2D) and MoE (3D) BF16-dequant fallbacks.
+    """
+    block_n, block_k = block_size
+    n, k = weight.shape[-2], weight.shape[-1]
+    w = weight.to(torch.float32)
+    scale = weight_scale.to(torch.float32)
+    ndim = w.ndim
+    scale = scale.repeat_interleave(block_n, dim=ndim - 2).repeat_interleave(
+        block_k, dim=ndim - 1
+    )
+    scale = scale[..., :n, :k]
+    return (w * scale).to(out_dtype)
+
+
 @triton.jit
 def _per_token_group_quant_fp8_kernel(
     y_ptr,

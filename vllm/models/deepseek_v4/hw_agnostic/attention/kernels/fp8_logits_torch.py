@@ -68,48 +68,104 @@ def _bf16_paged_mqa_logits_torch(
 ):
     """BF16-fallback paged MQA logits: read bf16 K directly, no fp8 scale.
 
-    Mirrors the CUDA-graph-safe ``next_n == 1`` path of the fp8 kernel but
-    the cache slot is ``dim`` bf16 values (no 4-byte scale)."""
+    Mirrors the fp8 kernel's two branches (CUDA-graph-safe ``next_n == 1``
+    fast path and the general ``next_n > 1`` MTP / speculative-decode loop),
+    but the cache slot is ``dim`` bf16 values with no 4-byte scale."""
     batch_size, next_n, _, dim = q.size()
     block_size = kv_cache.shape[1]
-    if context_lens.dim() > 1:
-        context_lens = context_lens.squeeze(-1)
-    head_width = dim * 2  # dim bf16 values, in bytes (uint8 cache)
-    kv_cache_flat = kv_cache.view(-1, block_size * head_width)
 
-    max_pages = block_tables.shape[1]
-    padded_seq_len = max_pages * block_size
+    if next_n == 1:
+        if context_lens.dim() > 1:
+            context_lens = context_lens.squeeze(-1)
+        head_width = dim * 2  # dim bf16 values, in bytes (uint8 cache)
+        kv_cache_flat = kv_cache.view(-1, block_size * head_width)
 
-    pages = block_tables[:batch_size, :max_pages]
-    cache = kv_cache_flat[pages]  # [B, max_pages, block_size * head_width]
+        max_pages = block_tables.shape[1]
+        padded_seq_len = max_pages * block_size
 
-    cache_value = (
-        cache.contiguous()
-        .view(torch.bfloat16)
-        .to(torch.float32)
-        .reshape(batch_size, padded_seq_len, dim)
-    )
+        pages = block_tables[:batch_size, :max_pages]
+        cache = kv_cache_flat[pages]  # [B, max_pages, block_size * head_width]
 
-    q_fp32 = q[:, 0].to(torch.float32)  # [B, num_heads, dim]
-    weights_b = weights[:batch_size]  # [B, num_heads]
+        cache_value = (
+            cache.contiguous()
+            .view(torch.bfloat16)
+            .to(torch.float32)
+            .reshape(batch_size, padded_seq_len, dim)
+        )
 
-    score = torch.einsum("btd,bhd->bth", cache_value, q_fp32)
-    score = F.relu(score)
-    score = score * weights_b.unsqueeze(1)
-    score = score.sum(dim=-1)  # [B, padded_seq_len]
+        q_fp32 = q[:, 0].to(torch.float32)  # [B, num_heads, dim]
+        weights_b = weights[:batch_size]  # [B, num_heads]
 
-    pos = torch.arange(padded_seq_len, device=q.device, dtype=context_lens.dtype)
-    valid = pos.unsqueeze(0) < context_lens.unsqueeze(1)
-    score = torch.where(valid, score, torch.full_like(score, float("-inf")))
+        score = torch.einsum("btd,bhd->bth", cache_value, q_fp32)
+        score = F.relu(score)
+        score = score * weights_b.unsqueeze(1)
+        score = score.sum(dim=-1)  # [B, padded_seq_len]
 
+        pos = torch.arange(padded_seq_len, device=q.device, dtype=context_lens.dtype)
+        valid = pos.unsqueeze(0) < context_lens.unsqueeze(1)
+        score = torch.where(valid, score, torch.full_like(score, float("-inf")))
+
+        logits = torch.full(
+            [batch_size, max_model_len],
+            float("-inf"),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        write_width = min(padded_seq_len, max_model_len)
+        logits[:, :write_width] = score[:, :write_width]
+        return logits
+
+    # next_n > 1 (MTP / speculative decode): per-request block loop. Mirrors
+    # the fp8 branch but reads bf16 values directly (no ``.view(fp8) * scale``
+    # and no scale tail on the slot).
+    kv_cache = kv_cache.view(torch.bfloat16).float()
+    q = q.float()
+    num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full(
-        [batch_size, max_model_len],
+        [batch_size * next_n, max_model_len],
         float("-inf"),
         device=q.device,
         dtype=torch.float32,
     )
-    write_width = min(padded_seq_len, max_model_len)
-    logits[:, :write_width] = score[:, :write_width]
+    for i in range(batch_size):
+        context_len = context_lens[i]
+        if context_len.ndim == 0:
+            context_len_i = int(context_len.item())
+            q_offsets = torch.arange(
+                context_len_i - next_n, context_len_i, device=q.device
+            )
+            context_limit = torch.full(
+                (next_n,), context_len_i, dtype=torch.int32, device=q.device
+            )
+        else:
+            context_limit = context_len.to(device=q.device, dtype=torch.int32)
+            q_offsets = context_limit - 1
+        weight_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
+        max_context_len = int(context_limit.max().item())
+        for block_rk in range(cdiv(max_context_len, block_size)):
+            block_idx = block_tables[i][block_rk]
+            qx, kx = q[i], kv_cache[block_idx]
+            k_offsets = torch.arange(
+                block_rk * block_size, (block_rk + 1) * block_size, device=q.device
+            )
+            mask = (k_offsets[None, :] < context_limit[:, None]) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            s = torch.where(
+                mask[None, :, :],
+                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
+                    logits.dtype
+                ),
+                float("-inf"),
+            )
+            s = torch.relu(s) * weight_slice[..., None]
+            s = s.sum(dim=0)
+            logits[
+                i * next_n : (i + 1) * next_n,
+                block_rk * block_size : (block_rk + 1) * block_size,
+            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
     return logits
 
 

@@ -154,14 +154,15 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         # fp8_ds_mla pages carry 584B of payload per token padded to 576B
         # alignment; the compressor's state pages share the physical
         # allocation with KV pages so they must use the same alignment.
-        uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        # The BF16 fallback slot needs no extra alignment.
+        uses_fp8 = kv_cache_uses_fp8()
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            alignment=576 if uses_fp8 else None,
         )
 
     def forward(self): ...

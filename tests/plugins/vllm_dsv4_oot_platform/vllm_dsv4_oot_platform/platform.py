@@ -11,6 +11,14 @@ if TYPE_CHECKING:
 class DSv4OOTPlatform(NvmlCudaPlatform):
     """Test-only OOT platform that piggybacks on CUDA infrastructure."""
 
+    # FP8 MoE experts are dequantized to BF16 at RUNTIME (per-forward), the
+    # memory-safe default: on the full DeepSeek-V4 model a load-time dequant
+    # doubles the expert weights (~35->69 GB/GPU) and OOMs the KV cache. The
+    # ``moe_dequant_at_load`` seam still exists for the generic Fp8MoEMethod
+    # to read via getattr; tests override it to True on a small layer to
+    # exercise the load-time path without OOMing a real model here.
+    moe_dequant_at_load: bool = False
+
     def is_out_of_tree(self) -> bool:
         return True
 

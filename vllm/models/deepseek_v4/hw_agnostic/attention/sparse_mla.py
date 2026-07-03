@@ -16,6 +16,10 @@ from vllm.model_executor.hw_agnostic.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.model_executor.hw_agnostic.v1.kv_cache_interface import AttentionSpec
+from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
+    BF16_TOKEN_BYTES,
+    FP8_TOKEN_BYTES,
+)
 from vllm.models.deepseek_v4.hw_agnostic.attention._metadata_utils import (
     split_decodes_and_prefills,
 )
@@ -127,10 +131,10 @@ class DeepseekV4HWAgnosticBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if cache_dtype_str == "fp8_ds_mla":
             # 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
-            return (num_blocks, block_size, 584)
+            return (num_blocks, block_size, FP8_TOKEN_BYTES)
         if cache_dtype_str == "bf16_ds_mla":
             # 1024B per token (512 bf16 values, no scale).
-            return (num_blocks, block_size, 1024)
+            return (num_blocks, block_size, BF16_TOKEN_BYTES)
         return (num_blocks, block_size, head_size)
 
 

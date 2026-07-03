@@ -155,7 +155,8 @@ def dsv4_sparse_attn_indexer(
         assert prefill_metadata is not None
 
         # Get the full shared workspace buffers once (will allocate on first
-        # use). Layout: ``head_dim`` fp8 bytes + 4-byte fp32 scale per token.
+        # use). Layout: ``head_dim`` values (fp8 or bf16 per ``values_dtype``)
+        # + a 4-byte scale slot (reserved; unused in bf16 mode) per token.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, values_dtype

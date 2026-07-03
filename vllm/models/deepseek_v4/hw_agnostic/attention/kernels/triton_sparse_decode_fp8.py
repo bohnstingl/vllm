@@ -7,6 +7,9 @@ import torch
 from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
     BF16_TOKEN_BYTES,
     FP8_TOKEN_DATA_SIZE,
+    MLA_NOPE_DIM,
+    MLA_ROPE_DIM,
+    MLA_VALUE_DIM,
     kv_cache_uses_fp8,
 )
 from vllm.models.deepseek_v4.hw_agnostic.attention.kernels.triton_mla_sparse import (
@@ -14,13 +17,12 @@ from vllm.models.deepseek_v4.hw_agnostic.attention.kernels.triton_mla_sparse imp
 )
 from vllm.triton_utils import tl, triton
 
-# FP8 DS MLA cache layout constants
-TOKEN_FP8_DIM = 448  # NoPE portion in FP8
-TOKEN_BF16_DIM = 64  # RoPE portion in BF16
+# FP8 DS MLA cache layout constants (sourced from _fp8_support).
+TOKEN_FP8_DIM = MLA_NOPE_DIM  # 448 NoPE portion in FP8
+TOKEN_BF16_DIM = MLA_ROPE_DIM  # 64 RoPE portion in BF16
 TOKEN_SCALE_DIM = 8  # UE8M0 scales per token
 QUANT_BLOCK_SIZE = 64  # Elements per quant block
-OUTPUT_DIM = 512  # = TOKEN_FP8_DIM + TOKEN_BF16_DIM after dequant
-TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2  # 576 bytes per token
+OUTPUT_DIM = MLA_VALUE_DIM  # 512 = NoPE + RoPE after dequant
 
 
 @triton.jit

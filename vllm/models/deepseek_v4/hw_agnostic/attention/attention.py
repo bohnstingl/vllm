@@ -31,12 +31,12 @@ from vllm.model_executor.hw_agnostic.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
-from vllm.models.deepseek_v4.hw_agnostic.attention.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.hw_agnostic.attention._fp8_support import (
     DSV4_BF16_DS_MLA,
     kv_cache_uses_fp8,
     mla_head_bytes,
 )
+from vllm.models.deepseek_v4.hw_agnostic.attention.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.hw_agnostic.attention.indexer import (
     DeepseekV4IndexerBackend,
     get_max_prefill_buffer_size,
@@ -757,7 +757,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
+        uses_fp8 = kv_cache_uses_fp8()
         return MLAAttentionSpec(
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
@@ -767,7 +767,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             # Match the fp8_ds_mla page alignment so the indexer's K cache
             # and the compressor's state pages share contiguous physical
             # blocks. The BF16 fallback slot needs no extra alignment.
-            alignment=576 if uses_fp8_ds_mla_layout else None,
+            alignment=576 if uses_fp8 else None,
         )
 
     def forward(self): ...

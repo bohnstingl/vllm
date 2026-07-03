@@ -43,12 +43,15 @@ BF16_TOKEN_BYTES = MLA_VALUE_DIM * 2  # 1024
 
 def kv_cache_uses_fp8() -> bool:
     """True when the packed FP8 KV cache is used; False for the BF16
-    fallback on platforms lacking native FP8 compute."""
-    return current_platform.supports_fp8_compute()
+    fallback on platforms lacking native FP8 compute.
+
+    Single source of truth for the DSv4 FP8/BF16 KV-cache decision: keyed
+    solely on ``current_platform.supports_fp8()`` (CUDA: sm_89+). The
+    resolved ``cache_dtype`` string (``fp8_ds_mla`` / ``bf16_ds_mla``) is a
+    derived artifact of this predicate, never a second gate."""
+    return current_platform.supports_fp8()
 
 
-def mla_head_bytes(use_fp8: bool | None = None) -> int:
+def mla_head_bytes() -> int:
     """Bytes per token in the sparse-MLA cache slot for the active layout."""
-    if use_fp8 is None:
-        use_fp8 = kv_cache_uses_fp8()
-    return FP8_TOKEN_BYTES if use_fp8 else BF16_TOKEN_BYTES
+    return FP8_TOKEN_BYTES if kv_cache_uses_fp8() else BF16_TOKEN_BYTES
