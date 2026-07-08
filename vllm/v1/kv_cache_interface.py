@@ -378,11 +378,21 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.cache_dtype_str == "fp8_ds_mla":
-            if self.model_version == "deepseek_v4":
-                # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
-                # head_size stays semantic (512); bytes are determined here.
+        if self.model_version == "deepseek_v4":
+            # DeepseekV4 custom packed sparse-MLA slots; head_size stays
+            # semantic (512), bytes are determined here. cache_dtype_str is the
+            # serialized form of the platform's supports_fp8() decision (set in
+            # DeepseekV4MLAAttention.__init__); this generic code dispatches on
+            # the string and never re-reads the platform.
+            if self.cache_dtype_str == "bf16_ds_mla":
+                # BF16 fallback (non-FP8 HW): 512 bf16 values, no scale block
+                # => 1024B per token.
+                return self.storage_block_size * 1024
+            if self.cache_dtype_str == "fp8_ds_mla":
+                # 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 return self.storage_block_size * 584
+            # Other dtypes fall through to the generic element-size formula.
+        elif self.cache_dtype_str == "fp8_ds_mla":
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
@@ -605,14 +615,23 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
-            # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
-            # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
-            # the element-size formula below.
-            return self.storage_block_size * 584
-        assert self.model_version in (None, "deepseek_v4"), (
-            f"Unsupported model version: {self.model_version}"
-        )
+        if self.model_version == "deepseek_v4":
+            # DeepseekV4 custom packed sparse-MLA slots. cache_dtype_str is the
+            # serialized form of the platform's supports_fp8() decision (set in
+            # DeepseekV4MLAAttention.__init__); this generic code dispatches on
+            # the string and never re-reads the platform.
+            if self.cache_dtype_str == "fp8_ds_mla":
+                # FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B/token.
+                return self.storage_block_size * 584
+            if self.cache_dtype_str == "bf16_ds_mla":
+                # BF16 fallback: 512 bf16 values = 1024B per token.
+                return self.storage_block_size * 1024
+            # FlashInfer's contiguous bf16/fp8 cache and any other dtype fall
+            # through to the generic element-size formula below.
+        else:
+            assert self.model_version is None, (
+                f"Unsupported model version: {self.model_version}"
+            )
         return (
             self.storage_block_size
             * self.num_kv_heads

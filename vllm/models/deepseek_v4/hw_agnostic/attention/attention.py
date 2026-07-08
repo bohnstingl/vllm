@@ -160,14 +160,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
-        # FP8 sparse layout; other dtypes live in HW-specific subtrees and
-        # are rejected at quant-config construction on this path.
-        head_bytes = (
-            self.nope_head_dim  # 448 fp8 NoPE
-            + self.rope_head_dim * 2  # 64 bf16 RoPE
-            + self.nope_head_dim // 64  # 7B scale
-            + 1  # 1B pad
-        )
+        head_bytes = self._mla_head_bytes()
 
         assert cache_config is not None
         self.swa_cache_layer = DeepseekV4SWACache(
@@ -216,6 +209,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.mla_attn.prefix,
             )
+
+    def _mla_head_bytes(self) -> int:
+        """Bytes per token in the sparse-MLA cache slot.
+
+        FP8 packs 448 fp8 NoPE + 64 bf16 RoPE + an 8B UE8M0 scale block
+        (7 real scale bytes + 1 pad). Overridable by OOT platforms that use
+        a different (e.g. all-BF16) slot layout.
+        """
+        return (
+            self.nope_head_dim  # 448 fp8 NoPE
+            + self.rope_head_dim * 2  # 64 bf16 RoPE
+            + self.nope_head_dim // 64  # 7B scale
+            + 1  # 1B pad
+        )
 
     def forward(
         self,
@@ -360,14 +367,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         swa_kv_cache = self.swa_cache_layer.kv_cache
         assert positions.dtype == torch.int64
 
-        triton_qnorm_rope_kv_fp8_insert(
+        self._insert_kv(
             q,
             kv,
             swa_kv_cache,
             swa_metadata.slot_mapping,
             positions,
-            self.rotary_emb.cos_sin_cache,
-            self.eps,
             swa_metadata.block_size,
         )
         # Kernel does not pad q; downstream MLA buffers are at padded_heads.
@@ -408,7 +413,8 @@ direct_register_custom_op(
 )
 
 
-class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
+@PluggableLayer.register("deepseek_v4_mla_attention")
+class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
     def __init__(
         self,
         num_heads: int,
@@ -459,15 +465,16 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 requires fp8 kv-cache, got {kv_cache_dtype}"
-        )
         assert issubclass(self.get_attn_backend(), DeepseekV4HWAgnosticBackend)
-        # Coerce ``fp8`` alias to the V4 layout (584B/token, UE8M0-block FP8).
-        if kv_cache_dtype != "fp8_ds_mla":
+        self.use_fp8_cache = self._uses_fp8_cache()
+        # Coerce to the V4 sparse-MLA cache layout for this platform. The
+        # resolved string is the serialized form of the platform decision and
+        # is consumed by the generic page-size / shape / alignment code.
+        target_cache_dtype = self._resolve_cache_dtype()
+        if kv_cache_dtype != target_cache_dtype:
             assert cache_config is not None
-            cache_config.cache_dtype = "fp8_ds_mla"
-            kv_cache_dtype = "fp8_ds_mla"
+            cache_config.cache_dtype = target_cache_dtype
+            kv_cache_dtype = target_cache_dtype
             logger.info_once("Using DeepSeek's fp8_ds_mla KV cache format.")
 
         self.kv_cache_dtype = kv_cache_dtype
@@ -479,6 +486,73 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             compilation_config.static_forward_context[prefix] = self
 
         self.kv_cache = torch.tensor([])
+
+    # --- Platform seams (overridable by OOT plugins) ----------------------
+    # These isolate every FP8-vs-alternative decision. The in-tree
+    # implementations describe the native FP8 path; an OOT platform that
+    # cannot run FP8 compute registers a subclass overriding them.
+
+    def _uses_fp8_cache(self) -> bool:
+        """Whether this layer uses the packed FP8 KV-cache layout."""
+        return True
+
+    def _resolve_cache_dtype(self) -> str:
+        """The cache_dtype string for this platform's sparse-MLA layout."""
+        return "fp8_ds_mla"
+
+    def _kv_cache_alignment(self) -> int | None:
+        """Page alignment for the sparse-MLA / compressor KV pages."""
+        # fp8_ds_mla page payload (584B/token) rounded up to 576B alignment;
+        # the Triton dequant kernel reads at the same stride.
+        return 576
+
+    def _insert_kv(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """qnorm + RoPE + quantized KV insert into the SWA cache."""
+        triton_qnorm_rope_kv_fp8_insert(
+            q,
+            kv,
+            swa_kv_cache,
+            slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            block_size,
+        )
+
+    def _gather_k(
+        self,
+        out: torch.Tensor,
+        k_cache: torch.Tensor,
+        seq_lens: torch.Tensor,
+        gather_lens: torch.Tensor | None,
+        block_table: torch.Tensor,
+        block_size: int,
+        offset: int,
+    ) -> None:
+        """Dequant + gather of a paged K cache into a BF16 workspace."""
+        dequantize_and_gather_k_cache(
+            out,
+            k_cache,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            block_table=block_table,
+            block_size=block_size,
+            offset=offset,
+        )
+
+    def _sparse_decode(self, **kwargs) -> None:
+        """Dequant paged cache + BF16 sparse-MLA decode attention."""
+        triton_sparse_decode_fp8(**kwargs)
+
+    # ----------------------------------------------------------------------
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV4HWAgnosticBackend
@@ -493,9 +567,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             dtype=torch.uint8,
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
-            # fp8_ds_mla page payload (584B/token) rounded up to 576B
-            # alignment; the Triton dequant kernel reads at the same stride.
-            alignment=576,
+            alignment=self._kv_cache_alignment(),
             model_version="deepseek_v4",
         )
 
@@ -592,8 +664,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
 
-        # FP8→BF16 dequant of the paged cache, then BF16 sparse attention.
-        triton_sparse_decode_fp8(
+        # Dequant of the paged cache, then BF16 sparse attention.
+        self._sparse_decode(
             q=q,
             kv_cache=kv_cache,
             swa_kv_cache=self.swa_cache_layer.kv_cache,
@@ -670,7 +742,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if not swa_only:
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
-                dequantize_and_gather_k_cache(
+                self._gather_k(
                     kv[:chunk_size],
                     compressed_k_cache,
                     seq_lens=seq_lens[chunk_start:chunk_end] // self.compress_ratio,
@@ -681,7 +753,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 )
 
             swa_block_table = swa_metadata.block_table[num_decodes:]
-            dequantize_and_gather_k_cache(
+            self._gather_k(
                 kv[:chunk_size],
                 swa_k_cache,
                 seq_lens=seq_lens[chunk_start:chunk_end],
@@ -732,6 +804,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         prefix: str,
         cache_config: CacheConfig,
         compress_ratio: int = 1,
+        alignment: int | None = 576,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -740,6 +813,9 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.cache_config = cache_config
         self.dtype = dtype
         self.compress_ratio = compress_ratio
+        # Match the KV page alignment so the indexer's K cache and the
+        # compressor's state pages share contiguous physical blocks.
+        self.alignment = alignment
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -752,10 +828,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.head_dim,
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
-            # Match the fp8_ds_mla page alignment so the indexer's K cache
-            # and the compressor's state pages share contiguous physical
-            # blocks.
-            alignment=576,
+            alignment=self.alignment,
         )
 
     def forward(self): ...
@@ -764,7 +837,8 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
         return DeepseekV4IndexerBackend
 
 
-class DeepseekV4Indexer(nn.Module):
+@PluggableLayer.register("deepseek_v4_indexer")
+class DeepseekV4Indexer(PluggableLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -820,14 +894,14 @@ class DeepseekV4Indexer(nn.Module):
         )
 
         assert cache_config is not None
-        # FP8 layout: 128 fp8 + 4 fp32 scale = 132 bytes/head_dim.
-        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+        k_cache_head_dim = self._indexer_k_cache_head_dim()
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
+            alignment=self._indexer_kv_cache_alignment(),
         )
         self.compressor = DeepseekCompressor(
             vllm_config=vllm_config,
@@ -851,6 +925,36 @@ class DeepseekV4Indexer(nn.Module):
             skip_k_cache_insert=True,
         )
 
+    # --- Platform seams (overridable by OOT plugins) ----------------------
+
+    def _indexer_k_cache_head_dim(self) -> int:
+        """Bytes per head_dim in the indexer K cache slot."""
+        # FP8 layout: 128 fp8 + 4 fp32 scale = 132 bytes/head_dim.
+        return self.head_dim + self.head_dim // self.quant_block_size * 4
+
+    def _indexer_kv_cache_alignment(self) -> int | None:
+        """Indexer K-cache page alignment (must track the KV layout)."""
+        return 576
+
+    def _quant_index_q(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        indexer_weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """RoPE + quantize the index query; returns (q_out, weights)."""
+        return fused_indexer_q_rope_quant(
+            positions,
+            q,
+            cos_sin_cache,
+            indexer_weights,
+            self.softmax_scale,
+            self.n_head**-0.5,
+        )
+
+    # ----------------------------------------------------------------------
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -863,12 +967,10 @@ class DeepseekV4Indexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         k = self.compressor(compressed_kv_score, positions, rotary_emb)
-        q_quant, weights = fused_indexer_q_rope_quant(
+        q_quant, weights = self._quant_index_q(
             positions,
             q,
             rotary_emb.cos_sin_cache,
             indexer_weights,
-            self.softmax_scale,
-            self.n_head**-0.5,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)
