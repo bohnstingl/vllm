@@ -18,6 +18,11 @@ class TritonFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     def is_supported(cls, compute_capability=None):
         if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
             return False, "only CUDA-alike and XPU devices are supported."
+        if not current_platform.supports_fp8():
+            # The block-scaled GEMM emits ``tl.float8e4nv``; decline on
+            # platforms without native FP8 compute so an OOT BF16 fallback
+            # kernel can be selected instead.
+            return False, "requires native FP8 compute (e.g. CUDA sm_89+)."
         return True, None
 
     def apply_block_scaled_mm(
