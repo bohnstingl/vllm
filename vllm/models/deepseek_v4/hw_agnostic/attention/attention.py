@@ -339,6 +339,32 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # `q` is padded to padded_heads by _fused_qnorm_rope_kv_insert.
         self.mla_attn(q, kv, positions, output=out)
 
+    def _insert_kv(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        swa_kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """qnorm + RoPE + quantized KV insert into the SWA cache.
+
+        Platform seam: the in-tree impl is the native FP8 insert; OOT
+        platforms override it (needs ``self.rotary_emb`` / ``self.eps``,
+        which live on this wrapper).
+        """
+        triton_qnorm_rope_kv_fp8_insert(
+            q,
+            kv,
+            swa_kv_cache,
+            slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            block_size,
+        )
+
     def _fused_qnorm_rope_kv_insert(
         self,
         q: torch.Tensor,
@@ -505,27 +531,6 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
         # fp8_ds_mla page payload (584B/token) rounded up to 576B alignment;
         # the Triton dequant kernel reads at the same stride.
         return 576
-
-    def _insert_kv(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        swa_kv_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        positions: torch.Tensor,
-        block_size: int,
-    ) -> None:
-        """qnorm + RoPE + quantized KV insert into the SWA cache."""
-        triton_qnorm_rope_kv_fp8_insert(
-            q,
-            kv,
-            swa_kv_cache,
-            slot_mapping,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            self.eps,
-            block_size,
-        )
 
     def _gather_k(
         self,
