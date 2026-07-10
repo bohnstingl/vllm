@@ -492,7 +492,6 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
 
         assert issubclass(self.get_attn_backend(), DeepseekV4HWAgnosticBackend)
-        self.use_fp8_cache = self._uses_fp8_cache()
         # Coerce to the V4 sparse-MLA cache layout for this platform. The
         # resolved string is the serialized form of the platform decision and
         # is consumed by the generic page-size / shape / alignment code.
@@ -517,10 +516,6 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
     # These isolate every FP8-vs-alternative decision. The in-tree
     # implementations describe the native FP8 path; an OOT platform that
     # cannot run FP8 compute registers a subclass overriding them.
-
-    def _uses_fp8_cache(self) -> bool:
-        """Whether this layer uses the packed FP8 KV-cache layout."""
-        return True
 
     def _resolve_cache_dtype(self) -> str:
         """The cache_dtype string for this platform's sparse-MLA layout."""
