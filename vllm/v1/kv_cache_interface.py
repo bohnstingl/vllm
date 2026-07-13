@@ -367,6 +367,9 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    # DeepseekV4 packed sparse-MLA slot size (bytes/token), supplied by the
+    # attention layer so this generic code needs no per-platform layout knowledge.
+    page_bytes_per_token: int | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -378,21 +381,15 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4":
-            # DeepseekV4 custom packed sparse-MLA slots; head_size stays
-            # semantic (512), bytes are determined here. cache_dtype_str is the
-            # serialized form of the platform's supports_fp8() decision (set in
-            # DeepseekV4MLAAttention.__init__); this generic code dispatches on
-            # the string and never re-reads the platform.
-            if self.cache_dtype_str == "bf16_ds_mla":
-                # BF16 fallback (non-FP8 HW): 512 bf16 values, no scale block
-                # => 1024B per token.
-                return self.storage_block_size * 1024
-            if self.cache_dtype_str == "fp8_ds_mla":
-                # 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+        # DeepseekV4 packed sparse-MLA slots: the attention layer can supply
+        # the exact per-token byte count so this generic code needs no
+        # per-platform layout knowledge (head_size stays semantic at 512).
+        if self.model_version == "deepseek_v4" and self.page_bytes_per_token is not None:
+            return self.storage_block_size * self.page_bytes_per_token
+        if self.cache_dtype_str == "fp8_ds_mla":
+            if self.model_version == "deepseek_v4":
+                # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
                 return self.storage_block_size * 584
-            # Other dtypes fall through to the generic element-size formula.
-        elif self.cache_dtype_str == "fp8_ds_mla":
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
@@ -415,11 +412,13 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        page_bytes_set = set(spec.page_bytes_per_token for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(page_bytes_set) == 1
             and len(block_stride_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
@@ -437,6 +436,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            page_bytes_per_token=page_bytes_set.pop(),
         )
 
 
@@ -605,6 +605,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    page_bytes_per_token: int | None = None  # see MLAAttentionSpec
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -615,23 +616,19 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.model_version == "deepseek_v4":
-            # DeepseekV4 custom packed sparse-MLA slots. cache_dtype_str is the
-            # serialized form of the platform's supports_fp8() decision (set in
-            # DeepseekV4MLAAttention.__init__); this generic code dispatches on
-            # the string and never re-reads the platform.
-            if self.cache_dtype_str == "fp8_ds_mla":
-                # FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B/token.
-                return self.storage_block_size * 584
-            if self.cache_dtype_str == "bf16_ds_mla":
-                # BF16 fallback: 512 bf16 values = 1024B per token.
-                return self.storage_block_size * 1024
-            # FlashInfer's contiguous bf16/fp8 cache and any other dtype fall
-            # through to the generic element-size formula below.
-        else:
-            assert self.model_version is None, (
-                f"Unsupported model version: {self.model_version}"
-            )
+        # DeepseekV4 packed sparse-MLA slots: the attention layer can supply
+        # the exact per-token byte count so this generic code needs no
+        # per-platform layout knowledge.
+        if self.model_version == "deepseek_v4" and self.page_bytes_per_token is not None:
+            return self.storage_block_size * self.page_bytes_per_token
+        if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
+            # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
+            # the element-size formula below.
+            return self.storage_block_size * 584
+        assert self.model_version in (None, "deepseek_v4"), (
+            f"Unsupported model version: {self.model_version}"
+        )
         return (
             self.storage_block_size
             * self.num_kv_heads
@@ -648,12 +645,14 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        page_bytes_set = set(spec.page_bytes_per_token for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(page_bytes_set) == 1
             and len(sliding_window_set) == 1
             and len(block_stride_set) == 1
         ), (
@@ -672,6 +671,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            page_bytes_per_token=page_bytes_set.pop(),
         )
 
     def is_uniform_with_collection(

@@ -35,6 +35,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix: str,
         cache_config: CacheConfig,
+        page_bytes_per_token: int,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -43,6 +44,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.page_bytes_per_token = page_bytes_per_token
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -66,6 +68,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else None,
             model_version="deepseek_v4",
+            page_bytes_per_token=self.page_bytes_per_token,
         )
 
     def forward(self): ...

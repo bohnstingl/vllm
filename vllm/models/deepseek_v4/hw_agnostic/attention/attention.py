@@ -169,6 +169,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             dtype=torch.uint8,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
+            page_bytes_per_token=head_bytes,
         )
 
         self.mla_attn = DeepseekV4MLAAttention(
@@ -512,11 +513,6 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
 
         self.kv_cache = torch.tensor([])
 
-    # --- Platform seams (overridable by OOT plugins) ----------------------
-    # These isolate every FP8-vs-alternative decision. The in-tree
-    # implementations describe the native FP8 path; an OOT platform that
-    # cannot run FP8 compute registers a subclass overriding them.
-
     def _resolve_cache_dtype(self) -> str:
         """The cache_dtype string for this platform's sparse-MLA layout."""
         return "fp8_ds_mla"
@@ -552,8 +548,6 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
         """Dequant paged cache + BF16 sparse-MLA decode attention."""
         triton_sparse_decode_fp8(**kwargs)
 
-    # ----------------------------------------------------------------------
-
     def get_attn_backend(self) -> type[AttentionBackend]:
         return DeepseekV4HWAgnosticBackend
 
@@ -569,6 +563,7 @@ class DeepseekV4MLAAttention(PluggableLayer, AttentionLayerBase):
             cache_dtype_str=self.kv_cache_dtype,
             alignment=self._kv_cache_alignment(),
             model_version="deepseek_v4",
+            page_bytes_per_token=self.head_bytes,
         )
 
     def forward(
@@ -925,8 +920,6 @@ class DeepseekV4Indexer(PluggableLayer):
             skip_k_cache_insert=True,
         )
 
-    # --- Platform seams (overridable by OOT plugins) ----------------------
-
     def _indexer_k_cache_head_dim(self) -> int:
         """Bytes per head_dim in the indexer K cache slot."""
         # FP8 layout: 128 fp8 + 4 fp32 scale = 132 bytes/head_dim.
@@ -952,8 +945,6 @@ class DeepseekV4Indexer(PluggableLayer):
             self.softmax_scale,
             self.n_head**-0.5,
         )
-
-    # ----------------------------------------------------------------------
 
     def forward(
         self,
