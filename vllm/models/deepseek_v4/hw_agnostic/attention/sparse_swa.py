@@ -35,6 +35,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         dtype: torch.dtype,
         prefix: str,
         cache_config: CacheConfig,
+        page_bytes_per_token: int,
     ):
         super().__init__()
         self.kv_cache = torch.tensor([])
@@ -43,6 +44,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.page_bytes_per_token = page_bytes_per_token
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -66,6 +68,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else None,
             model_version="deepseek_v4",
+            page_bytes_per_token=self.page_bytes_per_token,
         )
 
     def forward(self): ...
@@ -102,9 +105,14 @@ class DeepseekSparseSWABackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
+        # cache_dtype_str is the serialized form of the platform's
+        # supports_fp8() decision (set in DeepseekV4MLAAttention.__init__).
         if cache_dtype_str == "fp8_ds_mla":
             # 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "bf16_ds_mla":
+            # OOT BF16 fallback: 1024B per token (512 bf16 values, no scale).
+            return (num_blocks, block_size, 1024)
         return (num_blocks, block_size, head_size)
 
     @staticmethod

@@ -3,13 +3,13 @@
 """Sparse Attention Indexer (Triton + PyTorch)."""
 
 import torch
-import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.hw_agnostic._custom_op_lib import vllm_hw_agnostic_lib
+from vllm.model_executor.hw_agnostic.custom_op import PluggableLayer
 from vllm.models.deepseek_v4.hw_agnostic.attention.indexer import (
     DeepseekV4IndexerMetadata,
 )
@@ -262,7 +262,8 @@ direct_register_custom_op(
 )
 
 
-class SparseAttnIndexer(nn.Module):
+@PluggableLayer.register("sparse_attn_indexer")
+class SparseAttnIndexer(PluggableLayer):
     """Sparse Attention Indexer layer (Triton + PyTorch)."""
 
     def __init__(
@@ -288,16 +289,19 @@ class SparseAttnIndexer(nn.Module):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
 
-    def forward(
+    def _indexer_op(
         self,
         hidden_states: torch.Tensor,
         q_quant: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
-    ):
-        # Per-token Q scale is folded into ``weights`` earlier in the
-        # pipeline (``fused_indexer_q_rope_quant``); the kernel sees a
-        # single quantized tensor.
+    ) -> torch.Tensor:
+        """Dispatch to the indexer custom op.
+
+        In-tree this is the FP8 op; an OOT platform without FP8 compute
+        overrides this to call its own (BF16) op registered under the same
+        ``vllm_hw_agnostic`` library.
+        """
         return torch.ops.vllm_hw_agnostic.dsv4_sparse_attn_indexer(
             hidden_states,
             _encode_layer_name(self.k_cache.prefix),
@@ -314,3 +318,15 @@ class SparseAttnIndexer(nn.Module):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
         )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_quant: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ):
+        # Per-token Q scale is folded into ``weights`` earlier in the
+        # pipeline (``fused_indexer_q_rope_quant``); the kernel sees a
+        # single quantized tensor.
+        return self._indexer_op(hidden_states, q_quant, k, weights)

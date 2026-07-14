@@ -125,9 +125,14 @@ class DeepseekV4HWAgnosticBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        # cache_dtype_str is the serialized form of the platform's
+        # supports_fp8() decision (set in DeepseekV4MLAAttention.__init__).
         if cache_dtype_str == "fp8_ds_mla":
             # 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             return (num_blocks, block_size, 584)
+        if cache_dtype_str == "bf16_ds_mla":
+            # OOT BF16 fallback: 1024B per token (512 bf16 values, no scale).
+            return (num_blocks, block_size, 1024)
         return (num_blocks, block_size, head_size)
 
 

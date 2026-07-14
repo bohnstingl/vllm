@@ -8,6 +8,7 @@ from torch import nn
 
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.hw_agnostic.custom_op import PluggableLayer
 from vllm.model_executor.hw_agnostic.layers.attention_layer_base import (
     AttentionLayerBase,
 )
@@ -167,7 +168,8 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         return CompressorBackend
 
 
-class DeepseekCompressor(nn.Module):
+@PluggableLayer.register("deepseek_compressor")
+class DeepseekCompressor(PluggableLayer):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -232,16 +234,36 @@ class DeepseekCompressor(nn.Module):
 
         if self.head_dim == 512:
             self._quant_block = 64
-            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
-            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
         elif self.head_dim == 128:
             self._quant_block = 128
-            self._token_stride = self.head_dim
-            self._scale_dim = 4  # single float32 scale
         else:
             raise ValueError(
                 f"Unsupported head_dim for fused quant+cache: {self.head_dim}"
             )
+        self._token_stride, self._scale_dim = self._cache_slot_layout()
+
+    # --- Platform seams (overridable by OOT plugins) ----------------------
+
+    def _cache_slot_layout(self) -> tuple[int, int]:
+        """Return (token_stride, scale_dim) for the packed cache slot.
+
+        FP8 packs the NoPE region to fp8 + a UE8M0 scale block; RoPE stays
+        bf16.
+        """
+        if self.head_dim == 512:
+            # 448 fp8 NoPE + 64 bf16 RoPE (x2 bytes); 7 real + 1 pad scale.
+            token_stride = self.nope_head_dim + self.rope_head_dim * 2
+            scale_dim = self.nope_head_dim // 64 + 1
+        else:  # head_dim == 128
+            token_stride = self.head_dim  # 128 fp8
+            scale_dim = 4  # single float32 scale
+        return token_stride, scale_dim
+
+    def _store_compressed(self, **kwargs) -> None:
+        """Fused compress + norm + RoPE + quantized store into the cache."""
+        compress_norm_rope_store_triton(**kwargs)
+
+    # ----------------------------------------------------------------------
 
     def forward(
         self,
@@ -299,7 +321,7 @@ class DeepseekCompressor(nn.Module):
         k_cache_layer = self._static_forward_context[self.k_cache_prefix]
         kv_cache = k_cache_layer.kv_cache
 
-        compress_norm_rope_store_triton(
+        self._store_compressed(
             state_cache=state_cache,
             num_actual=num_actual,
             token_to_req_indices=token_to_req_indices,
