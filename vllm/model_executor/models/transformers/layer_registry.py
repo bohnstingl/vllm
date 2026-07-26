@@ -35,8 +35,15 @@ def _resolve(module: str, name: str):
     return getattr(importlib.import_module(f"{_VLLM_PKG}.{module}"), name)
 
 
-RMSNorm = _resolve("layernorm", "RMSNorm")
-GemmaRMSNorm = _resolve("layernorm", "GemmaRMSNorm")
+def get_rms_norm_cls():
+    """The `RMSNorm` class, preferring hw-agnostic. Resolved per call so it
+    tracks `VLLM_USE_HW_AGNOSTIC` regardless of import order."""
+    return _resolve("layernorm", "RMSNorm")
+
+
+def get_gemma_rms_norm_cls():
+    """The `GemmaRMSNorm` class, preferring hw-agnostic (resolved per call)."""
+    return _resolve("layernorm", "GemmaRMSNorm")
 
 
 def get_act_and_mul_fn(act_fn_name: str):

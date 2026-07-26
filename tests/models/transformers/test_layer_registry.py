@@ -14,6 +14,7 @@ import sys
 import types
 
 import pytest
+import torch
 
 from vllm.model_executor.models.transformers import layer_registry
 
@@ -71,3 +72,61 @@ def test_act_and_mul_falls_back_for_unknown_activation(
     from vllm.model_executor.layers.activation import GeluAndMul
 
     assert isinstance(layer_registry.get_act_and_mul_fn("gelu"), GeluAndMul)
+
+@pytest.fixture(scope="module")
+def tiny_llama_path(tmp_path_factory):
+    """A randomly-initialized microscopic Llama saved to disk (with an ungated
+    tokenizer) so vLLM can load it like any local checkpoint."""
+    from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    config = LlamaConfig(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+    )
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(config)
+
+    path = tmp_path_factory.mktemp("tiny_llama")
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    return str(path)
+
+
+def _greedy_logprobs(vllm_runner, model_path, prompts):
+    with vllm_runner(
+        model_path,
+        model_impl="transformers",
+        max_model_len=64,
+        enforce_eager=True,
+        gpu_memory_utilization=0.3,
+    ) as runner:
+        assert runner.llm.llm_engine.model_config.using_transformers_backend()
+        return runner.generate_greedy_logprobs(prompts, max_tokens=32, num_logprobs=5)
+
+
+def test_hw_agnostic_matches_vllm_end_to_end(
+    monkeypatch, vllm_runner, tiny_llama_path
+):
+    """Serving the tiny model with hw-agnostic layers matches the vLLM baseline."""
+    from ..utils import check_logprobs_close
+
+    prompts = ["The capital of France is", "vLLM is"]
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
+    vllm_outputs = _greedy_logprobs(vllm_runner, tiny_llama_path, prompts)
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    hw_outputs = _greedy_logprobs(vllm_runner, tiny_llama_path, prompts)
+
+    check_logprobs_close(
+        outputs_0_lst=vllm_outputs,
+        outputs_1_lst=hw_outputs,
+        name_0="vllm",
+        name_1="hw_agnostic",
+    )
