@@ -99,31 +99,35 @@ def tiny_llama_path(tmp_path_factory):
     return str(path)
 
 
-def _norm_provider(model) -> str:
-    """The top-level package the model's fused RMSNorms come from, as seen inside
-    the engine worker: ``hw_agnostic`` or the vLLM ``layers`` package. Runs via
-    `apply_model`, so it reflects the class actually built in that process."""
-    from vllm.model_executor.models.transformers.fusers.rms_norm import (
-        TPAwareNormMixin,
-    )
+# Registered names of the layers the backend can
+# currently route to hw-agnostic implementations.
+_COVERED_LAYERS = ("rms_norm", "silu_and_mul")
 
+
+def _layer_providers(model) -> dict[str, str]:
+    """Map each covered layer type present in the model to the provider its
+    implementation came from (``hw_agnostic`` or ``vllm``).
+    """
+
+    def provider_of(module) -> str | None:
+        for cls in type(module).__mro__:
+            if "hw_agnostic.layers" in cls.__module__:
+                return "hw_agnostic"
+            if ".model_executor.layers." in cls.__module__:
+                return "vllm"
+        return None
+
+    providers: dict[str, str] = {}
     for module in model.modules():
-        if isinstance(module, TPAwareNormMixin):
-            # MRO is [TPAware<Name>, TPAwareNormMixin, <provider RMSNorm>, ...].
-            # The first two live in the fuser module; the provider base is the
-            # first RMSNorm-named class from a layers package.
-            for cls in type(module).__mro__:
-                if not cls.__name__.endswith("RMSNorm"):
-                    continue
-                if "hw_agnostic.layers" in cls.__module__:
-                    return "hw_agnostic"
-                if cls.__module__.endswith("layers.layernorm"):
-                    return "vllm"
-    raise AssertionError("no fused RMSNorm found in the model")
+        name = getattr(module, "name", None)
+        if name in _COVERED_LAYERS and name not in providers:
+            if (prov := provider_of(module)) is not None:
+                providers[name] = prov
+    return providers
 
 
 def _serve(vllm_runner, model_path, prompts):
-    """Serve the model through the backend; return (norm_provider, greedy_logprobs)."""
+    """Serve the model through the backend; return (layer_providers, logprobs)."""
     with vllm_runner(
         model_path,
         model_impl="transformers",
@@ -132,23 +136,15 @@ def _serve(vllm_runner, model_path, prompts):
         gpu_memory_utilization=0.3,
     ) as runner:
         assert runner.llm.llm_engine.model_config.using_transformers_backend()
-        provider = runner.apply_model(_norm_provider)[0]
+        providers = runner.apply_model(_layer_providers)[0]
         outputs = runner.generate_greedy_logprobs(
             prompts, max_tokens=32, num_logprobs=5
         )
-        return provider, outputs
+        return providers, outputs
 
 
 def test_hw_agnostic_matches_vllm_end_to_end(monkeypatch, vllm_runner, tiny_llama_path):
-    """Serving the tiny model with hw-agnostic layers matches the vLLM baseline.
-
-    The provider is bound at import time in the engine worker. `spawn` starts the
-    worker as a fresh interpreter, so it imports `layer_registry` *after*
-    inheriting `VLLM_USE_HW_AGNOSTIC` from the environment (a forked worker would
-    instead inherit this test process's already-imported, vLLM-bound module). We
-    assert the RMSNorm actually built from the expected provider before comparing
-    outputs, so a failure to switch can't pass as a false positive.
-    """
+    """Serving the tiny model with hw-agnostic layers matches the vLLM baseline."""
     # spawn: worker re-imports layer_registry with the env set (see docstring).
     monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     # apply_model pickles the introspection function.
@@ -158,12 +154,13 @@ def test_hw_agnostic_matches_vllm_end_to_end(monkeypatch, vllm_runner, tiny_llam
     prompts = ["The capital of France is", "vLLM is"]
 
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
-    vllm_provider, vllm_outputs = _serve(vllm_runner, tiny_llama_path, prompts)
-    assert vllm_provider == "vllm"
+    vllm_providers, vllm_outputs = _serve(vllm_runner, tiny_llama_path, prompts)
+    # Both replaceable layers present in a Llama block must be vLLM's here.
+    assert vllm_providers == {"rms_norm": "vllm", "silu_and_mul": "vllm"}
 
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
-    hw_provider, hw_outputs = _serve(vllm_runner, tiny_llama_path, prompts)
-    assert hw_provider == "hw_agnostic"
+    hw_providers, hw_outputs = _serve(vllm_runner, tiny_llama_path, prompts)
+    assert hw_providers == {"rms_norm": "hw_agnostic", "silu_and_mul": "hw_agnostic"}
 
     check_logprobs_close(
         outputs_0_lst=vllm_outputs,
