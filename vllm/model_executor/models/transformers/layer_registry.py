@@ -2,25 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Layer provider resolution for the Transformers modeling backend.
 
-When ``VLLM_USE_HW_AGNOSTIC`` is set, layer classes are resolved from
+When ``VLLM_USE_HW_AGNOSTIC`` is set, layer symbols are imported from
 ``vllm.model_executor.hw_agnostic.layers.<module>``, falling back to
 ``vllm.model_executor.layers.<module>`` for anything not yet ported. The
-resolved source of every class is logged so it is clear which layers run
+resolved source of every symbol is logged so it is clear which layers run
 hw-agnostic and which fell back to vLLM.
-
-Resolution happens at import time: the classes below are bound once when this
-module is first imported. ``VLLM_USE_HW_AGNOSTIC`` is a launch-time setting
-(fixed before the process starts, and the backend is only imported while building
-a model), so import-time resolution reflects it correctly in real use.
-
-Limitation: because binding is at import time, a single running process cannot
-switch providers. Tests that exercise both settings must run each in a fresh
-interpreter (vLLM's engine process provides this).
-
-Use these at *construction* sites only. Do not subclass a resolved class or
-``isinstance``-check against it. Symbols used that way (e.g. ``MoERunner``), and
-those with no hw-agnostic equivalent (``conv``, ``pooler``), must be imported
-directly from ``vllm.model_executor.layers``.
 """
 
 import importlib
