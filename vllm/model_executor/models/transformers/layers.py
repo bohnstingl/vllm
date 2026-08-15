@@ -54,6 +54,31 @@ def get_logits_processor_cls():
     return _resolve("logits_processor", "LogitsProcessor")
 
 
+def get_replicated_linear_cls():
+    """`ReplicatedLinear` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("linear", "ReplicatedLinear")
+
+
+def get_column_parallel_linear_cls():
+    """`ColumnParallelLinear` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("linear", "ColumnParallelLinear")
+
+
+def get_row_parallel_linear_cls():
+    """`RowParallelLinear` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("linear", "RowParallelLinear")
+
+
+def get_merged_column_parallel_linear_cls():
+    """`MergedColumnParallelLinear` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("linear", "MergedColumnParallelLinear")
+
+
+def get_qkv_parallel_linear_cls():
+    """`QKVParallelLinear` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("linear", "QKVParallelLinear")
+
+
 def get_act_and_mul_fn(act_fn_name: str):
     """Fused activation-and-mul op for `act_fn_name`, preferring hw-agnostic.
 
