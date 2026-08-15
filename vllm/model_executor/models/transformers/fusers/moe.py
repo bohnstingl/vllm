@@ -14,12 +14,14 @@ from torch import fx, nn
 
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.fused_moe import GateLinear
-from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.transformers.fx_utils import (
     find_node,
     is_op,
     peel,
     trace,
+)
+from vllm.model_executor.models.transformers.layers import (
+    get_replicated_linear_cls,
 )
 from vllm.model_executor.models.transformers.utils import named_state
 from vllm.model_executor.models.utils import maybe_prefix, sequence_parallel_chunk
@@ -287,7 +289,7 @@ class MoEBlockFuser:
         gate = None
         if self.shared_gate_name is not None:
             hf_gate = getattr(moe_block, self.shared_gate_name)
-            gate = ReplicatedLinear(
+            gate = get_replicated_linear_cls()(
                 hf_gate.in_features,
                 hf_gate.out_features,
                 bias=hf_gate.bias is not None,
