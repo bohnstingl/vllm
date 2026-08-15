@@ -128,22 +128,31 @@ def replace_linear_class(
     if not isinstance(style, str):
         raise ValueError(f"Unsupported parallel style type {type(style)}, expected str")
 
-    vllm_linear_cls, vllm_linear_kwargs = {
-        "colwise": (ColumnParallelLinear, {}),
-        "rowwise": (RowParallelLinear, {}),
-        "replicate": (ReplicatedLinear, {}),
-        "colwise_gather_output": (ColumnParallelLinear, {"gather_output": True}),
-        "rowwise_split_input": (RowParallelLinear, {"input_is_parallel": False}),
-    }.get(style, (ReplicatedLinear, {}))
+    from vllm.model_executor.models.transformers.layers import (
+        get_column_parallel_linear_cls,
+        get_replicated_linear_cls,
+        get_row_parallel_linear_cls,
+    )
 
-    return vllm_linear_cls(
+    colwise = get_column_parallel_linear_cls()
+    rowwise = get_row_parallel_linear_cls()
+    replicate = get_replicated_linear_cls()
+    linear_cls, linear_kwargs = {
+        "colwise": (colwise, {}),
+        "rowwise": (rowwise, {}),
+        "replicate": (replicate, {}),
+        "colwise_gather_output": (colwise, {"gather_output": True}),
+        "rowwise_split_input": (rowwise, {"input_is_parallel": False}),
+    }.get(style, (replicate, {}))
+
+    return linear_cls(
         input_size=linear.in_features,
         output_size=linear.out_features,
         bias=linear.bias is not None,
         quant_config=quant_config,
         prefix=prefix,
         return_bias=False,
-        **vllm_linear_kwargs,
+        **linear_kwargs,
     )
 
 

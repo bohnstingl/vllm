@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, ClassVar
 from torch import fx, nn
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.models.transformers.fusers.base import StackedFuser
 from vllm.model_executor.models.transformers.fusers.rms_norm import RMSNormFuser
 from vllm.model_executor.models.transformers.fx_utils import (
@@ -24,6 +23,9 @@ from vllm.model_executor.models.transformers.fx_utils import (
     single_self_call,
     trace,
     upstream_linear,
+)
+from vllm.model_executor.models.transformers.layers import (
+    get_merged_column_parallel_linear_cls,
 )
 from vllm.model_executor.models.transformers.utils import (
     log_replacement,
@@ -291,7 +293,7 @@ class MLAFuser(StackedFuser):
         if self.has_q_lora:
             q_a = module.get_submodule(self.q_a_proj_name)
             kv_a = module.get_submodule(self.kv_a_proj_name)
-            merged = MergedColumnParallelLinear(
+            merged = get_merged_column_parallel_linear_cls()(
                 input_size=q_a.in_features,
                 output_sizes=[q_a.out_features, kv_a.out_features],
                 bias=q_a.bias is not None,

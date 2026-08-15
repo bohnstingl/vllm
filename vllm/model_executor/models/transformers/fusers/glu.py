@@ -12,7 +12,6 @@ from transformers.activations import ACT2CLS
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_AND_MUL_REGISTRY
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.models.transformers.fusers.base import StackedFuser
 from vllm.model_executor.models.transformers.fx_utils import (
     compile_forward,
@@ -23,7 +22,10 @@ from vllm.model_executor.models.transformers.fx_utils import (
     replace_expr,
     single_self_call,
 )
-from vllm.model_executor.models.transformers.layers import get_act_and_mul_fn
+from vllm.model_executor.models.transformers.layers import (
+    get_act_and_mul_fn,
+    get_merged_column_parallel_linear_cls,
+)
 from vllm.model_executor.models.transformers.utils import (
     log_replacement,
     replace_linear_class,
@@ -179,7 +181,7 @@ class GLUFuser(StackedFuser):
         act_fn = self._get_act_and_mul(module.get_submodule(self.act_name))
         gate = module.get_submodule(self.gate_name)
         up = module.get_submodule(self.up_name)
-        merged = MergedColumnParallelLinear(
+        merged = get_merged_column_parallel_linear_cls()(
             input_size=gate.in_features,
             output_sizes=[gate.out_features, up.out_features],
             bias=gate.bias is not None,

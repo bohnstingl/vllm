@@ -13,11 +13,15 @@ import importlib
 import logging
 import sys
 import types
+from contextlib import contextmanager
+from unittest import mock
 
 import pytest
 import torch
 
 from vllm.model_executor.models.transformers import layers
+
+from ...utils import multi_gpu_test
 
 HW_MODULE = "vllm.model_executor.hw_agnostic.layers.layernorm"
 
@@ -88,6 +92,11 @@ _CLASS_GETTERS = (
     ),
     ("get_parallel_lm_head_cls", "vocab_parallel_embedding", "ParallelLMHead"),
     ("get_logits_processor_cls", "logits_processor", "LogitsProcessor"),
+    ("get_replicated_linear_cls", "linear", "ReplicatedLinear"),
+    ("get_column_parallel_linear_cls", "linear", "ColumnParallelLinear"),
+    ("get_row_parallel_linear_cls", "linear", "RowParallelLinear"),
+    ("get_merged_column_parallel_linear_cls", "linear", "MergedColumnParallelLinear"),
+    ("get_qkv_parallel_linear_cls", "linear", "QKVParallelLinear"),
 )
 
 
@@ -181,6 +190,11 @@ _COVERED_LAYERS = (
     "vocab_parallel_embedding",
     "parallel_lm_head",
     "logits_processor",
+    # A fused dense Llama has only column- and row-parallel linears: fused
+    # qkv/gate_up report `column_parallel_linear` (their registered ancestor),
+    # and o_proj/down_proj are rowwise. No bare `ReplicatedLinear` survives.
+    "column_parallel_linear",
+    "row_parallel_linear",
 )
 
 
@@ -209,7 +223,7 @@ def _layer_providers(model) -> dict[str, str]:
     return providers
 
 
-def _serve(vllm_runner, model_path, prompts):
+def _serve(vllm_runner, model_path, prompts, tensor_parallel_size=1):
     """Serve the model through the backend; return (layer_providers, logprobs)."""
     with vllm_runner(
         model_path,
@@ -217,6 +231,7 @@ def _serve(vllm_runner, model_path, prompts):
         max_model_len=64,
         enforce_eager=True,
         gpu_memory_utilization=0.3,
+        tensor_parallel_size=tensor_parallel_size,
     ) as runner:
         assert runner.llm.llm_engine.model_config.using_transformers_backend()
         providers = runner.apply_model(_layer_providers)[0]
@@ -281,3 +296,125 @@ def test_hw_agnostic_matches_vllm_with_tied_lm_head(
         name_0="vllm",
         name_1="hw_agnostic",
     )
+
+
+@multi_gpu_test(num_gpus=2)
+def test_hw_agnostic_matches_vllm_tp(monkeypatch, vllm_runner, tiny_llama_path):
+    """With TP=2 the hw-agnostic linears still match vLLM: guards the
+    column/row-parallel weight loaders and sharding of the ported classes."""
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    from ..utils import check_logprobs_close
+
+    prompts = ["The capital of France is", "vLLM is"]
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
+    _, vllm_outputs = _serve(
+        vllm_runner, tiny_llama_path, prompts, tensor_parallel_size=2
+    )
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    hw_providers, hw_outputs = _serve(
+        vllm_runner, tiny_llama_path, prompts, tensor_parallel_size=2
+    )
+    assert hw_providers == dict.fromkeys(_COVERED_LAYERS, "hw_agnostic")
+
+    check_logprobs_close(
+        outputs_0_lst=vllm_outputs,
+        outputs_1_lst=hw_outputs,
+        name_0="vllm",
+        name_1="hw_agnostic",
+    )
+
+
+def test_fp8_subtree_imports():
+    """The hw-agnostic FP8 linear closure imports cleanly (guards the subtree)."""
+    import vllm.model_executor.hw_agnostic.quantization.fp8_linear_method  # noqa: F401
+    from vllm.model_executor.hw_agnostic.kernels.linear import (
+        init_fp8_linear_kernel,  # noqa: F401
+    )
+
+
+def _fp8_config(weight_shape=(256, 256)):
+    """A block-scaled FP8 kernel config (per-group activation scales)."""
+    from vllm.model_executor.hw_agnostic.kernels.linear import (
+        FP8ScaledMMLinearLayerConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        GroupShape,
+        create_fp8_quant_key,
+    )
+
+    return FP8ScaledMMLinearLayerConfig(
+        weight_quant_key=create_fp8_quant_key(True, GroupShape(128, 128)),
+        activation_quant_key=create_fp8_quant_key(False, GroupShape(1, 128)),
+        input_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        weight_shape=weight_shape,
+    )
+
+
+@contextmanager
+def _as_cuda():
+    """Present as a CUDA platform so kernel selection runs without a GPU."""
+    from vllm.platforms import PlatformEnum, current_platform
+
+    with (
+        mock.patch.object(current_platform, "_enum", PlatformEnum.CUDA),
+        mock.patch.object(current_platform, "is_cuda_alike", return_value=True),
+        mock.patch.object(current_platform, "is_xpu", return_value=False),
+    ):
+        yield
+
+
+def test_fp8_selector_defaults_to_triton_on_cuda(monkeypatch):
+    """`auto` backend selects the Triton block-scaled kernel on CUDA."""
+    monkeypatch.setattr("vllm.envs.VLLM_DISABLED_KERNELS", [])
+    from vllm.model_executor.hw_agnostic.kernels.linear import (
+        _POSSIBLE_FP8_BLOCK_KERNELS,
+        TritonFp8BlockScaledMMKernel,
+        choose_scaled_mm_linear_kernel,
+    )
+
+    with _as_cuda():
+        chosen = choose_scaled_mm_linear_kernel(
+            _fp8_config(), _POSSIBLE_FP8_BLOCK_KERNELS, compute_capability=90
+        )
+    assert chosen is TritonFp8BlockScaledMMKernel
+
+
+def test_fp8_selector_falls_back_to_torch_when_triton_disabled(monkeypatch):
+    """Disabling the Triton kernel falls through to the portable torch kernel."""
+    from vllm.model_executor.hw_agnostic.kernels.linear import (
+        _POSSIBLE_FP8_BLOCK_KERNELS,
+        ChannelWiseTorchFP8ScaledMMLinearKernel,
+        choose_scaled_mm_linear_kernel,
+    )
+
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_DISABLED_KERNELS", ["TritonFp8BlockScaledMMKernel"]
+    )
+    with _as_cuda():
+        chosen = choose_scaled_mm_linear_kernel(
+            _fp8_config(), _POSSIBLE_FP8_BLOCK_KERNELS, compute_capability=90
+        )
+    assert chosen is ChannelWiseTorchFP8ScaledMMLinearKernel
+
+
+def test_fp8_init_rejects_non_block_scaled():
+    """Per-tensor FP8 is unsupported: block-scaled (per-group) only."""
+    from vllm.model_executor.hw_agnostic.kernels.linear import init_fp8_linear_kernel
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        GroupShape,
+        create_fp8_quant_key,
+    )
+
+    per_tensor = create_fp8_quant_key(True, GroupShape.PER_TENSOR)
+    with pytest.raises(NotImplementedError):
+        init_fp8_linear_kernel(
+            activation_quant_key=per_tensor,
+            weight_quant_key=per_tensor,
+            input_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            weight_shape=(256, 256),
+        )
