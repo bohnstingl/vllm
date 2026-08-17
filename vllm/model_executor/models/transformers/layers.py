@@ -79,6 +79,45 @@ def get_qkv_parallel_linear_cls():
     return _resolve("linear", "QKVParallelLinear")
 
 
+def get_attention_cls():
+    """`Attention` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("attention", "Attention")
+
+
+def get_mla_attention_cls():
+    """`MLAAttention` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("attention", "MLAAttention")
+
+
+def get_encoder_only_attention_cls():
+    """`EncoderOnlyAttention` class, preferring hw-agnostic. Resolved per call."""
+    return _resolve("attention", "EncoderOnlyAttention")
+
+
+def get_attention_backend_cls():
+    """Portable Triton attention backend when hw-agnostic is enabled, else None.
+
+    Unlike the layer getters, this resolves a full attention *backend* that has
+    no same-named vLLM counterpart. Returning `None` when disabled (or when the
+    backend cannot be imported) lets the `Attention` layer run its own
+    `get_attn_backend` selector and pick the platform default.
+    """
+    if not envs.VLLM_USE_HW_AGNOSTIC:
+        return None
+    try:
+        from vllm.model_executor.hw_agnostic.v1.attention.triton_backend import (
+            TritonAttentionBackend,
+        )
+
+        logger.info("Using hw-agnostic attention backend: TritonAttentionBackend")
+        return TritonAttentionBackend
+    except ImportError:
+        logger.warning(
+            "hw-agnostic attention backend is not available; falling back to default"
+        )
+        return None
+
+
 def get_act_and_mul_fn(act_fn_name: str):
     """Fused activation-and-mul op for `act_fn_name`, preferring hw-agnostic.
 

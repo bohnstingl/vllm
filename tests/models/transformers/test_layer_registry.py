@@ -98,6 +98,9 @@ _CLASS_GETTERS = (
     ("get_row_parallel_linear_cls", "linear", "RowParallelLinear"),
     ("get_merged_column_parallel_linear_cls", "linear", "MergedColumnParallelLinear"),
     ("get_qkv_parallel_linear_cls", "linear", "QKVParallelLinear"),
+    ("get_attention_cls", "attention", "Attention"),
+    ("get_mla_attention_cls", "attention", "MLAAttention"),
+    ("get_encoder_only_attention_cls", "attention", "EncoderOnlyAttention"),
 )
 
 
@@ -142,6 +145,81 @@ def test_class_getter_falls_back_when_symbol_missing(
         resolved = getattr(layers, getter)()
     assert resolved is vllm_cls
     assert "falling back to default" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "getter,name",
+    [
+        ("get_attention_cls", "Attention"),
+        ("get_mla_attention_cls", "MLAAttention"),
+        ("get_encoder_only_attention_cls", "EncoderOnlyAttention"),
+    ],
+)
+def test_attention_reexport_preserves_identity(monkeypatch, getter, name):
+    vllm_cls = getattr(
+        importlib.import_module("vllm.model_executor.layers.attention"), name
+    )
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    assert getattr(layers, getter)() is vllm_cls
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
+    assert getattr(layers, getter)() is vllm_cls
+
+
+def test_vllm_attention_forward_applies_module_scaling():
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.transformers import vllm_attention_forward
+
+    impl = SimpleNamespace(scale=4**-0.5)
+    self_attn = SimpleNamespace(
+        impl=impl, forward=lambda q, k, v: torch.zeros(q.shape[0], q.shape[1])
+    )
+    module = SimpleNamespace(layer_idx=0)
+    qkv = torch.zeros(1, 2, 3, 4)  # [batch, heads, tokens, head_dim]
+
+    vllm_attention_forward(
+        module,
+        qkv,
+        qkv,
+        qkv,
+        attention_mask=None,
+        scaling=0.123,
+        attention_instances={0: self_attn},
+    )
+    assert impl.scale == pytest.approx(0.123)
+
+
+def test_attention_backend_getter_disabled_returns_none(monkeypatch):
+    """Disabled: no hw backend is forced; the layer picks the platform default."""
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
+    assert layers.get_attention_backend_cls() is None
+
+
+def test_attention_backend_getter_enabled_returns_triton(monkeypatch, caplog):
+    """Enabled: the getter returns the portable hw-agnostic Triton backend."""
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    from vllm.model_executor.hw_agnostic.v1.attention.triton_backend import (
+        TritonAttentionBackend,
+    )
+
+    with caplog.at_level(logging.INFO):
+        resolved = layers.get_attention_backend_cls()
+    assert resolved is TritonAttentionBackend
+    assert "hw-agnostic attention backend" in caplog.text
+
+
+def test_hw_agnostic_triton_backend_is_portable():
+    """The vendored backend imports without vendor deps and keeps the enum-valid
+    `TRITON_ATTN` name (required by `AttentionBackendEnum[...]`), while living in
+    the hw-agnostic tree so the seam is distinguishable from the in-tree one."""
+    from vllm.model_executor.hw_agnostic.v1.attention import triton_backend as hw
+
+    assert hw.TritonAttentionBackend.get_name() == "TRITON_ATTN"
+    assert hw.TritonAttentionBackend.get_impl_cls() is hw.TritonAttentionImpl
+    # The ROCm aiter import is stripped, so the module never binds the symbol,
+    # and the vendor fused-rope override is dropped to the base default.
+    assert not hasattr(hw, "rocm_aiter_ops")
+    assert "do_rope_and_kv_cache_update" not in vars(hw.TritonAttentionImpl)
 
 
 def _save_tiny_llama(tmp_path_factory, name: str, *, tie_word_embeddings: bool) -> str:

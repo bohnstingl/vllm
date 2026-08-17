@@ -42,7 +42,6 @@ from vllm.distributed.utils import get_pp_indices
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import (
     Attention,
-    EncoderOnlyAttention,
     MLAAttention,
 )
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
@@ -527,6 +526,10 @@ class Base(
         """
         Create `Attention` instances to inform KV cache allocation.
         """
+        from vllm.model_executor.models.transformers.layers import (
+            get_attention_backend_cls,
+        )
+
         mla_fusers = {}
         attention_instances = {}
         text_config = self.text_config
@@ -596,6 +599,12 @@ class Base(
                     logits_soft_cap=logits_soft_cap,
                 )
 
+                # Route full/encoder attention through the hw-agnostic Triton
+                # backend when enabled; otherwise the layer selects the platform
+                # default. MLA is not covered by this portable backend.
+                if (attn_backend := get_attention_backend_cls()) is not None:
+                    kwargs["attn_backend"] = attn_backend
+
                 # Handle interleaved sliding window attention
                 if (
                     hasattr(text_config, "layer_types")
@@ -613,6 +622,12 @@ class Base(
 
     def _get_attn_cls(self) -> type[AttentionLayerBase]:
         """Return the `Attention` class to use for this model's layers."""
+        from vllm.model_executor.models.transformers.layers import (
+            get_attention_cls,
+            get_encoder_only_attention_cls,
+            get_mla_attention_cls,
+        )
+
         # In encoder models, the attention layers will have `is_causal=False`
         is_encoder = lambda module: not getattr(module, "is_causal", True)
         has_encoder = lambda model: any(is_encoder(m) for m in model.modules())
@@ -621,18 +636,18 @@ class Base(
         # found in a text only model, we assume the whole model is an encoder model
         if has_encoder(self.model) and not is_multimodal(self.config):
             self.check_version("5.0.0", "encoder models support")
-            return EncoderOnlyAttention
+            return get_encoder_only_attention_cls()
         if self.model_config.use_mla:
             self.check_version("5.15.0.dev0", "optimized MLA support")
             if any(isinstance(fuser, MLAFuser) for fuser in self.fusers.values()):
-                return MLAAttention
+                return get_mla_attention_cls()
             logger.warning_once(
                 "This model uses MLA but `MLAFuser` failed to match and/or fuse any "
                 "MLA attention layers. Falling back to full attention with a padded "
                 "`value` head dimension."
             )
             os.environ["VLLM_MLA_DISABLE"] = "1"
-        return Attention
+        return get_attention_cls()
 
     def init_parameters(self, module: nn.Module, dtype: torch.dtype | None = None):
         """
