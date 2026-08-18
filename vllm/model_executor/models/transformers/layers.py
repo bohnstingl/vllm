@@ -98,12 +98,23 @@ def get_attention_backend_cls():
     """Portable Triton attention backend when hw-agnostic is enabled, else None.
 
     Unlike the layer getters, this resolves a full attention *backend* that has
-    no same-named vLLM counterpart. Returning `None` when disabled (or when the
-    backend cannot be imported) lets the `Attention` layer run its own
-    `get_attn_backend` selector and pick the platform default.
+    no same-named vLLM counterpart. Returning `None` when disabled, when Triton
+    is unusable, or when the backend cannot be imported lets the `Attention`
+    layer run its own `get_attn_backend` selector and pick the platform default.
     """
     if not envs.VLLM_USE_HW_AGNOSTIC:
         return None
+
+    from vllm.triton_utils import HAS_TRITON
+
+    if not HAS_TRITON:
+        logger.warning_once(
+            "hw-agnostic attention backend requires Triton, which is not "
+            "usable on this platform; falling back to the platform default "
+            "attention backend."
+        )
+        return None
+
     try:
         from vllm.model_executor.hw_agnostic.v1.attention.triton_backend import (
             TritonAttentionBackend,
