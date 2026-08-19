@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RMSNorm fuser: detect the norm structurally and swap in vLLM's fused RMSNorm."""
 
+import functools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ from vllm.distributed import (
 )
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.distributed.utils import split_tensor_along_last_dim
+from vllm.model_executor.custom_op import op_registry_oot
 from vllm.model_executor.models.transformers.fusers.base import BaseFuser
 from vllm.model_executor.models.transformers.fx_utils import (
     find_node,
@@ -114,6 +116,47 @@ class TPAwareGemmaRMSNorm(TPAwareNormMixin, GemmaRMSNorm):
     """`GemmaRMSNorm` that reconstructs a TP-sharded input before normalizing."""
 
 
+def _norm_impl(base: type[nn.Module]) -> type[nn.Module]:
+    """`base`, or the out-of-tree class registered under its name if usable."""
+    impl = op_registry_oot.get(base.__name__, base)
+    # A non-subclass is not a usable override: `CustomOp.__new__` would refuse
+    # the swap anyway, so keep the in-tree implementation.
+    return impl if issubclass(impl, base) else base
+
+
+@functools.cache
+def _build_tp_aware(base: type[nn.Module], impl: type[nn.Module]) -> type[nn.Module]:
+    """Cached `type()` call for `_tp_aware`, keyed on the resolved override.
+
+    Named after `impl`, not `base`, so a module repr or stack trace names the
+    implementation that actually runs (`TPAwareSpyreRMSNorm`, not the
+    indistinguishable `TPAwareRMSNorm` that a skipped override would give).
+    """
+    del base  # only part of the cache key
+    return type(f"TPAware{impl.__name__}", (TPAwareNormMixin, impl), {})
+
+
+def _tp_aware(base: type[nn.Module]) -> type[nn.Module]:
+    """The TP-aware norm class to build, honouring out-of-tree overrides.
+
+    `CustomOp.__new__` keys the out-of-tree swap on `cls.__name__`, so a fixed
+    subclass named `TPAwareRMSNorm` never matches a platform plugin's
+    ``"RMSNorm"`` registration: the plugin's kernels are silently skipped and
+    the in-tree ones run instead. That is not merely a slow path — on backends
+    whose override exists because the in-tree implementation is invalid there
+    (e.g. Spyre, where `forward_native` promotes to float32 and torch-spyre
+    does not support that promotion), it produces wrong numerics.
+
+    So derive from the override when one is registered, which keeps both the
+    plugin's kernels and the TP gather. The result is cached on the resolved
+    pair, so a later registration change is picked up rather than stale.
+    """
+    impl = _norm_impl(base)
+    if impl is base:
+        return TPAwareGemmaRMSNorm if base is GemmaRMSNorm else TPAwareRMSNorm
+    return _build_tp_aware(base, impl)
+
+
 @dataclass
 class RMSNormFuser(BaseFuser):
     """Fuser for RMSNorm patterns, including Gemma-style zero-centered weights."""
@@ -124,7 +167,8 @@ class RMSNormFuser(BaseFuser):
     """Class name of the norm this was matched from (for logging)."""
 
     def info(self, name: str) -> str:
-        norm = "GemmaRMSNorm" if self.zero_centered else "RMSNorm"
+        base = GemmaRMSNorm if self.zero_centered else RMSNorm
+        norm = _norm_impl(base).__name__
         return f"Fused: {name} ({self.source_cls}) -> {norm} (CustomOp)"
 
     @classmethod
@@ -203,8 +247,8 @@ class RMSNormFuser(BaseFuser):
             dtype = weight.dtype if has_weight else vllm_config.model_config.dtype
             eps = torch.finfo(dtype).eps
         if self.zero_centered:
-            return TPAwareGemmaRMSNorm(hidden_size=hidden_size, eps=eps)
-        return TPAwareRMSNorm(
+            return _tp_aware(GemmaRMSNorm)(hidden_size=hidden_size, eps=eps)
+        return _tp_aware(RMSNorm)(
             hidden_size=hidden_size,
             eps=eps,
             has_weight=has_weight,
