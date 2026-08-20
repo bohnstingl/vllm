@@ -196,7 +196,15 @@ def test_attention_backend_getter_disabled_returns_none(monkeypatch):
 
 
 def test_attention_backend_getter_enabled_returns_triton(monkeypatch, caplog):
-    """Enabled: the getter returns the portable hw-agnostic Triton backend."""
+    """Enabled: the getter returns the portable hw-agnostic Triton backend.
+
+    Only where Triton is usable. The backend module imports cleanly without
+    Triton — `TritonPlaceholder` makes `@triton.jit` a passthrough — so the
+    getter checks `HAS_TRITON` up front rather than letting the first kernel
+    launch fail; where it is unusable, the platform default is the right answer.
+    """
+    from vllm.triton_utils import HAS_TRITON
+
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
     from vllm.model_executor.hw_agnostic.v1.attention.triton_backend import (
         TritonAttentionBackend,
@@ -204,7 +212,10 @@ def test_attention_backend_getter_enabled_returns_triton(monkeypatch, caplog):
 
     with caplog.at_level(logging.INFO):
         resolved = layers.get_attention_backend_cls()
-    assert resolved is TritonAttentionBackend
+    if HAS_TRITON:
+        assert resolved is TritonAttentionBackend
+    else:
+        assert resolved is None
     assert "hw-agnostic attention backend" in caplog.text
 
 
