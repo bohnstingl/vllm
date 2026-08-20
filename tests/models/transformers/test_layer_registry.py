@@ -432,6 +432,11 @@ _HW_AGNOSTIC_LAYERS = (
     ("logits_processor", "LogitsProcessor"),
     ("vocab_parallel_embedding", "VocabParallelEmbedding"),
     ("vocab_parallel_embedding", "ParallelLMHead"),
+    ("linear", "ReplicatedLinear"),
+    ("linear", "ColumnParallelLinear"),
+    ("linear", "MergedColumnParallelLinear"),
+    ("linear", "QKVParallelLinear"),
+    ("linear", "RowParallelLinear"),
 )
 
 
@@ -667,6 +672,31 @@ def test_general_plugins_open_the_scope_only_when_enabled(monkeypatch, hw_agnost
             _hw_layer(module, name) if hw_agnostic == "1" else _vllm_layer(module, name)
         )
         assert seen[(module, name)] is expected
+
+
+def test_layer_names_scope_covers_the_quant_method(monkeypatch):
+    """The linear quant methods are rebound too.
+
+    Plugins gate on `isinstance(self.quant_method, UnquantizedLinearMethod)`, and
+    the hw-agnostic layers install their own `UnquantizedLinearMethod`. Without
+    the rebinding that check silently answers False on the hw-agnostic path and
+    the plugin's fast GEMM never runs.
+    """
+    import vllm.model_executor.layers.linear as vllm_linear
+    from vllm.model_executor.hw_agnostic.layers._layer_names import (
+        hw_agnostic_layer_names,
+    )
+    from vllm.model_executor.hw_agnostic.layers.linear import (
+        LinearMethodBase as HwLinearMethodBase,
+    )
+    from vllm.model_executor.hw_agnostic.layers.linear import (
+        UnquantizedLinearMethod as HwUnquantizedLinearMethod,
+    )
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    with hw_agnostic_layer_names():
+        assert vllm_linear.UnquantizedLinearMethod is HwUnquantizedLinearMethod
+        assert vllm_linear.LinearMethodBase is HwLinearMethodBase
 
 
 @pytest.mark.parametrize("module,name", _HW_AGNOSTIC_LAYERS)
