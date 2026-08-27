@@ -66,6 +66,9 @@ logger = init_logger(__name__)
 
 _MODALITY_TO_TOKEN_TYPE_ID = {"image": 1, "video": 2, "audio": 3}
 
+# Names under which a config may nest its audio tower's config.
+_AUDIO_CONFIG_NAMES = ("audio_config", "encoder_config")
+
 
 class MultiModalProcessingInfo(BaseProcessingInfo):
     def _get_audio_processor(self) -> Any:
@@ -74,8 +77,38 @@ class MultiModalProcessingInfo(BaseProcessingInfo):
             self.get_hf_processor(), ("audio_processor", "feature_extractor")
         )
 
+    def _get_audio_config(self) -> Any:
+        """The nested config of the audio tower, or `None` if there is none.
+
+        Not `getattr_iter`: that returns the first name which *exists*, even when
+        its value is `None`, so a checkpoint shipping `"audio_config": null` would
+        shadow both `encoder_config` and any fallback.
+        """
+        config = self.get_hf_config()
+        return next(
+            (
+                sub
+                for name in _AUDIO_CONFIG_NAMES
+                if (sub := getattr(config, name, None)) is not None
+            ),
+            None,
+        )
+
     def _is_audio_model(self) -> bool:
-        return self._get_audio_processor() is not None
+        if self._get_audio_processor() is None:
+            return False
+        if self._get_audio_config() is not None:
+            return True
+        # A processor may expose a feature extractor unconditionally while the
+        # checkpoint has no audio tower: Gemma4Processor takes `feature_extractor`
+        # as a required ctor argument, yet e.g. google/gemma-4-31b ships
+        # `"audio_config": null`. When the config declares an audio sub-config and
+        # leaves it empty, believe the config -- this mirrors the native Gemma4
+        # path (`Gemma4ProcessingInfo.get_supported_mm_limits`).
+        # Flat audio configs (e.g. Whisper) nest nothing at all, and there the
+        # processor is the only signal available.
+        config = self.get_hf_config()
+        return not any(hasattr(config, name) for name in _AUDIO_CONFIG_NAMES)
 
     def _is_image_model(self) -> bool:
         return hasattr(self.get_hf_processor(), "image_processor")
@@ -137,10 +170,18 @@ class MultiModalProcessingInfo(BaseProcessingInfo):
 
     def get_max_audio_tokens(self) -> int:
         config = self.get_hf_config()
-        audio_config_names = ("audio_config", "encoder_config")
         names = ("max_source_positions", "max_position_embeddings", "max_pos_emb")
-        audio_config = getattr_iter(config, audio_config_names, default=config)
+        audio_config = self._get_audio_config()
+        if audio_config is None:
+            audio_config = config
         val = getattr_iter(audio_config, names)
+        if val is not None:
+            return int(val)
+        # Not every audio tower is bounded by a positional embedding: Gemma4's
+        # conformer has none of the names above and its processor carries the
+        # per-segment soft-token cap instead, which is what the native Gemma4 path
+        # uses too (`Gemma4ProcessingInfo.get_mm_max_tokens_per_item`).
+        val = getattr(self.get_hf_processor(), "audio_seq_length", None)
         if val is not None:
             return int(val)
         raise ValueError(
