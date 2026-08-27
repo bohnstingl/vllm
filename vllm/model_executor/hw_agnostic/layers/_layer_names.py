@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Resolving `vllm.model_executor.layers.<mod>.X` to 
+"""Resolving `vllm.model_executor.layers.<mod>.X` to
 `vllm.model_executor.hw_agnostic.layers.<mod>.X`.
 
-"""
+The hw-agnostic layers are self-contained implementations, so a layer name
+denotes two unrelated classes, the hw-agnostic and the hw-specific.
+An out-of-tree plugin might subclass
+`from vllm.model_executor.layers.<mod> import X` or
+`from vllm.model_executor.hw_agnostic.layers.<mod> import X`.
+
+In case of `from vllm.model_executor.layers.<mod> import X`,
+`hw_agnostic_layer_names()` rebinds the in-tree names to the
+hw-agnostic classes."""
 
 import importlib
 from types import ModuleType, TracebackType

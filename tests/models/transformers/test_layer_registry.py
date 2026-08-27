@@ -79,9 +79,22 @@ def test_act_and_mul_falls_back_for_unknown_activation(
     `default_vllm_config` supplies the config context the CustomOp needs.
     """
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
-    from vllm.model_executor.layers.activation import GeluAndMul
+    from vllm.model_executor.layers.activation import SwigluOAIAndMul
 
-    assert isinstance(layers.get_act_and_mul_fn("gelu"), GeluAndMul)
+    assert isinstance(layers.get_act_and_mul_fn("swigluoai"), SwigluOAIAndMul)
+
+
+def test_act_and_mul_uses_hw_agnostic_gelu(monkeypatch, default_vllm_config):
+    """`gelu_pytorch_tanh` (used by Gemma) resolves to the hw-agnostic GeGLU.
+
+    `default_vllm_config` supplies the config context the CustomOp needs.
+    """
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    from vllm.model_executor.hw_agnostic.layers.activation import GeluAndMul
+
+    act = layers.get_act_and_mul_fn("gelu_pytorch_tanh")
+    assert isinstance(act, GeluAndMul)
+    assert act.approximate == "tanh"
 
 
 # Each getter and the module/class name it resolves between the two trees.
@@ -385,14 +398,14 @@ def test_layer_names_scope_leaves_unported_layers_alone(monkeypatch):
     """Names with no hw-agnostic implementation keep their in-tree class.
 
     The same fallback the modeling side takes in `_resolve`, so a plugin's
-    `GeluAndMul` override still lands on the class that gets built.
+    `SwigluOAIAndMul` override still lands on the class that gets built.
     """
     from vllm.model_executor.hw_agnostic.layers._layer_names import (
         hw_agnostic_layer_names,
     )
 
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
-    unported = (("activation", "GeluAndMul"), ("layernorm", "GemmaRMSNorm"))
+    unported = (("activation", "SwigluOAIAndMul"), ("layernorm", "GemmaRMSNorm"))
     before = {(m, n): _vllm_layer(m, n) for m, n in unported}
 
     with hw_agnostic_layer_names():
@@ -551,8 +564,12 @@ def test_correctly_based_override_passes_validation(monkeypatch):
     # paths, so an override based on it is right and must not be flagged.
     monkeypatch.setitem(
         op_registry_oot,
-        "GeluAndMul",
-        type("PluginGeluAndMul", (_vllm_layer("activation", "GeluAndMul"),), {}),
+        "SwigluOAIAndMul",
+        type(
+            "PluginSwigluOAIAndMul",
+            (_vllm_layer("activation", "SwigluOAIAndMul"),),
+            {},
+        ),
     )
 
     validate_registered_overrides(_MIRRORED_MODULES)

@@ -179,6 +179,21 @@ class Base(
                 replace_embedding_class(input_embeddings, self.quant_config)
             )
 
+        # # Per-layer input embeddings (e.g. Gemma3n/Gemma4 PLE), when present.
+        # # These are a second vocab embedding table that recursive_replace does
+        # # not reach, so give them the same treatment as the input embeddings.
+        # get_per_layer_embeddings = getattr(
+        #     self.model, "get_per_layer_input_embeddings", None
+        # )
+        # if get_per_layer_embeddings is not None:
+        #     per_layer_embeddings = get_per_layer_embeddings()
+        #     if per_layer_embeddings is not None and not isinstance(
+        #         per_layer_embeddings, PPMissingLayer
+        #     ):
+        #         self.model.set_per_layer_input_embeddings(
+        #             replace_embedding_class(per_layer_embeddings, self.quant_config)
+        #         )
+
         # Initialize any parameters that have not had their modules replaced
         self.init_parameters(self.model)
 
