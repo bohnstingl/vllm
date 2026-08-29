@@ -49,8 +49,26 @@ def _is_squared(node: object, x: fx.Node) -> bool:
     return False
 
 
+def _is_inverse_sqrt(node: object) -> bool:
+    """`rsqrt(v)`, or the `pow(v, -0.5)` / `v ** -0.5` spelling of it.
+
+    HF's Gemma-4 norm writes the reciprocal square root as `torch.pow(v, -0.5)`
+    (`Gemma4RMSNorm._norm`), so matching `rsqrt` alone leaves it unfused.
+    """
+    node = peel(node)
+    if is_op(node, "rsqrt"):
+        return True
+    if is_op(node, "pow"):
+        return len(node.args) == 2 and node.args[1] == -0.5
+    return False
+
+
 def _variance_eps(rsqrt: fx.Node, x: fx.Node) -> float | None:
-    """eps from `rsqrt(mean(x**2, -1) + eps)`, or `None` if not that shape."""
+    """eps from `rsqrt(mean(x**2, -1) + eps)`, or `None` if not that shape.
+
+    `rsqrt` is any node whose first argument is the variance, so it covers the
+    `pow(v, -0.5)` spelling too (see `_is_inverse_sqrt`).
+    """
     add = peel(rsqrt.args[0])
     if not is_op(add, "add"):
         return None
@@ -189,7 +207,7 @@ class RMSNormFuser(BaseFuser):
         # The rsqrt over the mean-square variance is the spine of the norm.
         rsqrt = None
         for node in graph.nodes:
-            if is_op(node, "rsqrt") and _variance_eps(node, x) is not None:
+            if _is_inverse_sqrt(node) and _variance_eps(node, x) is not None:
                 rsqrt = node
                 break
         if rsqrt is None:
@@ -226,7 +244,7 @@ class RMSNormFuser(BaseFuser):
             eps = args[3] if len(args) > 3 else kwargs.get("eps")
             return eps if isinstance(eps, (int, float)) else None
         for node in graph.nodes:
-            if is_op(node, "rsqrt") and (eps := _variance_eps(node, x)) is not None:
+            if _is_inverse_sqrt(node) and (eps := _variance_eps(node, x)) is not None:
                 return eps
         return None
 
