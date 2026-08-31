@@ -157,6 +157,31 @@ def getattr_iter(
     return default_factory() if default_factory is not None else default
 
 
+def is_per_layer_attribute(config: object, name: str) -> bool:
+    """Whether *config* sizes *name* per layer, making a global read ambiguous."""
+    return name in (getattr(config, "per_layer_attributes", None) or ())
+
+
+def configured_values(config: object, name: str) -> set[Any]:
+    """Every distinct value *config* configures for *name*, across all layers.
+
+    transformers 5.x lets a model size attention per layer -- Gemma 4 rotates 256
+    dims per head on its sliding layers and 512 on its global ones -- and such a
+    config rejects a plain `config.head_dim` read as ambiguous
+    (`AmbiguousGlobalPerLayerAttributeError`) rather than answering with the global
+    value. That is not an `AttributeError`, so a `getattr` default does not catch
+    it; ask the per-layer views whenever there are any.
+
+    Empty when *config* does not configure *name*. `None` and `0` both count as
+    unconfigured, since some config classes materialize a missing value that way.
+    """
+    if is_per_layer_attribute(config, name):
+        values = {getattr(layer, name, None) for layer in config.per_layer_config}
+    else:
+        values = {getattr(config, name, None)}
+    return {value for value in values if value}
+
+
 def get_attr_docs(cls: type[Any]) -> dict[str, str]:
     """
     Get any docstrings placed after attribute assignments in a class body.

@@ -11,7 +11,7 @@ from vllm import envs
 from vllm.config.model_arch import (
     ModelArchitectureConfig,
 )
-from vllm.config.utils import getattr_iter
+from vllm.config.utils import configured_values, getattr_iter, is_per_layer_attribute
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import (
     ConfigFormat,
@@ -59,11 +59,11 @@ class ModelArchConfigConvertorBase:
                     return qk_rope_head_dim + qk_nope_head_dim
 
         # NOTE: Some config classes may set head_dim=None or materialize a missing
-        # head_dim as 0 (for example, DeepseekVLV2TextConfig).
-        if (
-            head_dim := getattr(self.hf_text_config, "head_dim", None)
-        ) is not None and head_dim > 0:
-            return head_dim
+        # head_dim as 0 (for example, DeepseekVLV2TextConfig). Heterogeneous configs
+        # size heads per layer (Gemma 4: 256 sliding, 512 full), so take the widest
+        # -- buffers sized from this must hold every layer.
+        if head_dims := configured_values(self.hf_text_config, "head_dim"):
+            return max(head_dims)
 
         # NOTE: Some models (such as PLaMo2.1) use `hidden_size_per_head`
         if getattr(self.hf_text_config, "hidden_size_per_head", None) is not None:
@@ -107,6 +107,13 @@ class ModelArchConfigConvertorBase:
         return qk_rope_head_dim
 
     def get_total_num_kv_heads(self) -> int:
+        # Heterogeneous configs size KV heads per layer (Gemma 4: 16 sliding, 4 full);
+        # take the widest. Handled before `getattr_iter`, whose `hasattr` probe would
+        # raise on such a config rather than report the attribute as absent.
+        if is_per_layer_attribute(self.hf_text_config, "num_key_value_heads"):
+            per_layer = configured_values(self.hf_text_config, "num_key_value_heads")
+            return max(per_layer) if per_layer else self.get_total_num_attention_heads()
+
         attributes = [
             # For Falcon:
             "n_head_kv",
@@ -602,12 +609,13 @@ class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
         )
 
     def get_head_size(self) -> int:
-        # Gemma4 uses dual head dimensions: head_dim (sliding attention)
-        # and global_head_dim (full attention).  Return the largest so
-        # that attention backends allocate buffers large enough for both.
-        head_dim = getattr(self.hf_text_config, "head_dim", 0)
-        global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
-        return max(head_dim, global_head_dim) or super().get_head_size()
+        # Gemma4 uses dual head dimensions for sliding vs full attention: transformers
+        # 5.x carries both in `per_layer_config`, older configs pair a global
+        # `head_dim` with `global_head_dim`. Return the largest so that attention
+        # backends allocate buffers large enough for both.
+        head_dims = configured_values(self.hf_text_config, "head_dim")
+        head_dims |= configured_values(self.hf_text_config, "global_head_dim")
+        return max(head_dims, default=0) or super().get_head_size()
 
 
 class MossAudioModelArchConfigConvertor(ModelArchConfigConvertorBase):
