@@ -9,10 +9,12 @@ is set and the symbol exists, and otherwise falls back to
 logging that reports which source was used.
 """
 
+import ast
 import importlib
 import logging
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -223,6 +225,44 @@ def test_custom_op_plumbing_is_shared():
         "maybe_get_oot_by_class",
     ):
         assert getattr(hw_plumbing, attr) is getattr(vllm_plumbing, attr), attr
+
+
+def test_hw_agnostic_registry_access_goes_through_the_seam():
+    """No hw-agnostic module reaches the plumbing past `custom_op.py`.
+
+    The seam (`hw_agnostic/custom_op.py`) is the one place that borrows the
+    plumbing from the native `vllm.model_executor.custom_op`; every other module
+    under `hw_agnostic/` imports it from the seam instead. Pinning this keeps the
+    eventual ownership flip -- native stops owning the registry, hw-agnostic
+    starts -- a one-file change: a direct native import elsewhere would bypass
+    the seam and, after the flip, point at the removed module.
+    """
+    import vllm.model_executor.hw_agnostic as hw_pkg
+
+    native = "vllm.model_executor.custom_op"
+    root = Path(hw_pkg.__file__).parent
+    seam = root / "custom_op.py"
+
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path == seam:
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                hits_native = node.module == native
+            elif isinstance(node, ast.Import):
+                hits_native = any(alias.name == native for alias in node.names)
+            else:
+                continue
+            if hits_native:
+                offenders.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert not offenders, (
+        "hw-agnostic modules must reach the plumbing through "
+        "hw_agnostic/custom_op.py, not import it from the native "
+        f"{native!r} directly: {offenders}"
+    )
 
 
 @pytest.mark.parametrize("module,name", _HW_AGNOSTIC_LAYERS)

@@ -1,14 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HW-agnostic view of the custom-op plumbing.
+"""HW-agnostic view of the custom-op plumbing, and the seam for its migration.
 
-This module holds no registry of its own: `CustomOp`, `PluggableLayer` and the
-two registries are identity-bearing, so `vllm.model_executor.custom_op` stays the
-single source of truth and they are re-exported from it unchanged.
+`CustomOp`, `PluggableLayer`, the two registries (`op_registry`,
+`op_registry_oot`) and `maybe_get_oot_by_class` are identity-bearing: one shared
+object each, so an OOT plugin registering against `vllm.model_executor.custom_op`
+is honored on the hw-agnostic path too. During the transition the native module
+`vllm.model_executor.custom_op` still *owns* (defines) them and this module
+*borrows* them by re-export -- the native path is left untouched, since
+model-specific development depends on it.
 
-What it adds are two thin wrappers, `HwAgnosticCustomOp` and
-`HwAgnosticPluggableLayer`, which the hw-agnostic layers import under the base
-classes' own names:
+This module is the sole seam through which the hw-agnostic path reaches that
+plumbing: every module under `vllm/model_executor/hw_agnostic/` imports it from
+here, never from the native module directly (pinned by
+`test_hw_agnostic_registry_access_goes_through_the_seam`). That keeps the
+eventual ownership flip a one-file change.
+
+Switch-over -- when the native registry is removed and the OOT-override API
+becomes hw-agnostic-only:
+
+    1. Move the `CustomOp` / `PluggableLayer` / `op_registry` /
+       `op_registry_oot` / `maybe_get_oot_by_class` definitions here, so the
+       hw-agnostic module becomes the owner.
+    2. Flip the import below: `vllm.model_executor.custom_op` becomes the thin
+       re-export shim, so its public import path keeps resolving during the
+       native path's own deprecation.
+    3. Retire the native readers (`maybe_get_oot_by_class` in the LoRA layers
+       and `mm_encoder_attention`) as native layers go hardware-specific.
+
+On top of the borrowed plumbing this module adds two thin wrappers,
+`HwAgnosticCustomOp` and `HwAgnosticPluggableLayer`, which the hw-agnostic layers
+import under the base classes' own names:
 
     from vllm.model_executor.hw_agnostic.custom_op import (
         HwAgnosticCustomOp as CustomOp,

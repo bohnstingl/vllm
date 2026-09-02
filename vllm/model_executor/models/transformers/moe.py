@@ -28,7 +28,7 @@ from vllm.config.utils import getattr_iter
 from vllm.distributed import get_dp_group, get_ep_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.hw_agnostic.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     MoERunner,
