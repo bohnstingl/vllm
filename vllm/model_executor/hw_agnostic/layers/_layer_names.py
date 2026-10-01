@@ -35,6 +35,9 @@ _MIRRORED_MODULES: dict[str, str] = {
     "vllm.model_executor.layers.layernorm": (
         "vllm.model_executor.hw_agnostic.layers.layernorm"
     ),
+    "vllm.model_executor.layers.linear": (
+        "vllm.model_executor.hw_agnostic.layers.linear"
+    ),
     "vllm.model_executor.layers.logits_processor": (
         "vllm.model_executor.hw_agnostic.layers.logits_processor"
     ),
