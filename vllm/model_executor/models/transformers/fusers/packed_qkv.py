@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from torch import fx, nn
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.models.transformers.fusers.base import (
     RewriteFuser,
     fused_head_size,
@@ -21,6 +20,9 @@ from vllm.model_executor.models.transformers.fx_utils import (
     recover_forward,
     returned_linear,
     upstream_linear,
+)
+from vllm.model_executor.models.transformers.layers import (
+    get_qkv_parallel_linear_cls,
 )
 from vllm.model_executor.models.transformers.utils import (
     log_replacement,
@@ -141,7 +143,7 @@ class PackedQKVFuser(RewriteFuser):
         head_size = fused_head_size(module, vllm_config)
         qkv_prefix = maybe_prefix(prefix, self.qkv_name)
         qkv = module.get_submodule(self.qkv_name)
-        merged = QKVParallelLinear(
+        merged = get_qkv_parallel_linear_cls()(
             hidden_size=qkv.in_features,
             head_size=head_size,
             total_num_heads=self.q_size // head_size,
