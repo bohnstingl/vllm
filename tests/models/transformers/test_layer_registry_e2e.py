@@ -67,8 +67,8 @@ def _layer_providers(model) -> dict[str, str]:
     return providers
 
 
-def _serve(vllm_runner, model_path, prompts):
-    """Serve the model through the backend; return (layer_providers, logprobs)."""
+def _serve(vllm_runner, model_path, prompts, inspect=_layer_providers):
+    """Serve the model through the backend; return (`inspect(model)`, logprobs)."""
     with vllm_runner(
         model_path,
         model_impl="transformers",
@@ -77,7 +77,7 @@ def _serve(vllm_runner, model_path, prompts):
         gpu_memory_utilization=0.3,
     ) as runner:
         assert runner.llm.llm_engine.model_config.using_transformers_backend()
-        providers = runner.apply_model(_layer_providers)[0]
+        providers = runner.apply_model(inspect)[0]
         outputs = runner.generate_greedy_logprobs(
             prompts, max_tokens=32, num_logprobs=5
         )
@@ -104,6 +104,95 @@ def test_hw_agnostic_matches_vllm_end_to_end(monkeypatch, vllm_runner, tiny_llam
     monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
     hw_providers, hw_outputs = _serve(vllm_runner, tiny_llama_path, prompts)
     assert hw_providers == {"rms_norm": "hw_agnostic", "silu_and_mul": "hw_agnostic"}
+
+    check_logprobs_close(
+        outputs_0_lst=vllm_outputs,
+        outputs_1_lst=hw_outputs,
+        name_0="vllm",
+        name_1="hw_agnostic",
+    )
+
+
+@pytest.fixture(scope="module")
+def tiny_qwen3_moe_path(tmp_path_factory):
+    """A randomly-initialized microscopic Qwen3-MoE, which the backend routes
+    internally (softmax top-k with renormalization)."""
+    from transformers import AutoTokenizer, Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    config = Qwen3MoeConfig(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        num_experts=8,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+    )
+    torch.manual_seed(0)
+    model = Qwen3MoeForCausalLM(config)
+
+    path = tmp_path_factory.mktemp("tiny_qwen3_moe")
+    model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    return str(path)
+
+
+def _moe_providers(model) -> dict[str, str]:
+    """The provider of each MoE component of the first MoE layer."""
+    from vllm.model_executor.layers.fused_moe import MoERunner
+
+    def provider_of(obj) -> str:
+        return "hw_agnostic" if ".hw_agnostic." in type(obj).__module__ else "vllm"
+
+    runner = next(m for m in model.modules() if isinstance(m, MoERunner))
+    quant_method = runner.routed_experts.quant_method
+    assert quant_method.moe_kernel is not None
+    return {
+        "quant_method": provider_of(quant_method),
+        "kernel": provider_of(quant_method.moe_kernel),
+        "experts": provider_of(quant_method.moe_kernel.fused_experts),
+        "gate": provider_of(runner.gate),
+        "router": type(runner.router).__name__,
+    }
+
+
+def test_hw_agnostic_moe_matches_vllm_end_to_end(
+    monkeypatch, vllm_runner, tiny_qwen3_moe_path
+):
+    """The MoE experts, gate and routing run hw-agnostic and match vLLM's."""
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    from ..utils import check_logprobs_close
+
+    prompts = ["The capital of France is", "vLLM is"]
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "0")
+    vllm_providers, vllm_outputs = _serve(
+        vllm_runner, tiny_qwen3_moe_path, prompts, _moe_providers
+    )
+    assert vllm_providers == {
+        "quant_method": "vllm",
+        "kernel": "vllm",
+        "experts": "vllm",
+        "gate": "vllm",
+        "router": "FusedTopKRouter",
+    }
+
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    hw_providers, hw_outputs = _serve(
+        vllm_runner, tiny_qwen3_moe_path, prompts, _moe_providers
+    )
+    assert hw_providers == {
+        "quant_method": "hw_agnostic",
+        "kernel": "hw_agnostic",
+        "experts": "hw_agnostic",
+        "gate": "hw_agnostic",
+        "router": "CustomRoutingRouter",
+    }
 
     check_logprobs_close(
         outputs_0_lst=vllm_outputs,

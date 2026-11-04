@@ -106,6 +106,33 @@ def test_broken_hw_agnostic_module_raises(monkeypatch, tmp_path):
         hw_agnostic.resolve("broken_port", "Layer")
 
 
+@pytest.mark.parametrize("use_hw_agnostic", [False, True])
+def test_resolves_moe_gate(monkeypatch, use_hw_agnostic):
+    """The MoE gate resolves to its hw-agnostic class only when enabled."""
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", str(int(use_hw_agnostic)))
+    package = "hw_agnostic.layers" if use_hw_agnostic else "layers"
+    expected = importlib.import_module(
+        f"vllm.model_executor.{package}.fused_moe.router.gate_linear"
+    )
+
+    resolved = hw_agnostic.resolve("fused_moe.router.gate_linear", "GateLinear")
+    assert resolved is expected.GateLinear
+
+
+def test_hw_agnostic_moe_method_rejects_unsupported_layer(default_vllm_config):
+    """A layer the hw-agnostic experts cannot serve raises with the reason,
+    instead of falling back to another experts backend."""
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.hw_agnostic.layers.fused_moe.unquantized_fused_moe_method import (  # noqa: E501
+        UnquantizedFusedMoEMethod,
+    )
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+    moe_config = make_dummy_moe_config(activation=MoEActivation.SILU_NO_MUL)
+    with pytest.raises(NotImplementedError, match="SILU_NO_MUL activation"):
+        UnquantizedFusedMoEMethod(moe_config)
+
+
 def test_act_and_mul_falls_back_for_unknown_activation(
     monkeypatch, default_vllm_config
 ):
