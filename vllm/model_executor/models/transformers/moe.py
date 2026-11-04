@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.utils import getattr_iter
 from vllm.distributed import get_dp_group, get_ep_group
@@ -31,10 +32,13 @@ from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoEConfig,
     FusedMoEFactory,
+    FusedMoEMethodBase,
     MoERunner,
     RoutedExperts,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.model_executor.models.transformers.fuser import get_fuser
 from vllm.model_executor.models.transformers.fusers.glu import GLUFuser
@@ -169,6 +173,24 @@ class TransformersRoutedExperts(RoutedExperts):
     _is_mixtral_format: bool | None = None
     """Does the checkpoint use Mixtral style naming. `None` until weights are loaded."""
 
+    def _get_quant_method(
+        self,
+        prefix: str,
+        quant_config: QuantizationConfig | None,
+        moe_config: FusedMoEConfig,
+    ) -> FusedMoEMethodBase:
+        if not envs.VLLM_USE_HW_AGNOSTIC:
+            return super()._get_quant_method(prefix, quant_config, moe_config)
+        if quant_config is not None:
+            raise NotImplementedError(
+                "Quantized MoE is not supported with VLLM_USE_HW_AGNOSTIC=1 yet."
+            )
+        from vllm.model_executor.hw_agnostic.layers.fused_moe.unquantized_fused_moe_method import (  # noqa: E501
+            UnquantizedFusedMoEMethod,
+        )
+
+        return UnquantizedFusedMoEMethod(moe_config)
+
     def get_expert_mapping(
         self,
         ckpt_gate_proj_name: str | None = None,
@@ -257,7 +279,9 @@ class MoEMixin(MixtureOfExperts, Base):
         # Routed scaling factor kwargs
         routed_scaling_factor = getattr(text_config, "routed_scaling_factor", 1.0)
         # aiter applies routed_scaling_factor internally
-        apply_routed_scale_to_output = not rocm_aiter_ops.is_fused_moe_enabled()
+        apply_routed_scale_to_output = (
+            envs.VLLM_USE_HW_AGNOSTIC or not rocm_aiter_ops.is_fused_moe_enabled()
+        )
         routed_scaling_factor_kwargs = dict(
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scale_to_output=apply_routed_scale_to_output,
@@ -395,7 +419,6 @@ class MoEMixin(MixtureOfExperts, Base):
                             router_dtype = config_router_dtype or fuser.router_dtype
                             gate = fuser.gate(moe_block, prefix, router_dtype)
                             kwargs |= dict(
-                                scoring_func=scoring_func,
                                 renormalize=(
                                     layer_renormalize
                                     if fuser.renormalize is None
@@ -405,13 +428,30 @@ class MoEMixin(MixtureOfExperts, Base):
                             )
                             if router_dtype is not None:
                                 kwargs["router_logits_dtype"] = router_dtype
-                            if use_grouped_topk:
-                                kwargs |= grouped_topk_routing_kwargs
                             if routed_scaling_factor != 1.0:
                                 kwargs |= routed_scaling_factor_kwargs
                             bias = getattr(gate, "e_score_correction_bias", None)
-                            if bias is not None:
-                                kwargs["e_score_correction_bias"] = bias
+                            if envs.VLLM_USE_HW_AGNOSTIC:
+                                from vllm.model_executor.hw_agnostic.layers.fused_moe.router.topk import (  # noqa: E501
+                                    grouped_topk,
+                                )
+
+                                # Plain top-k is grouped top-k with a single group
+                                kwargs["custom_routing_function"] = partial(
+                                    grouped_topk,
+                                    num_expert_group=(
+                                        num_expert_group if use_grouped_topk else 1
+                                    ),
+                                    topk_group=topk_group if use_grouped_topk else 1,
+                                    scoring_func=scoring_func,
+                                    e_score_correction_bias=bias,
+                                )
+                            else:
+                                kwargs["scoring_func"] = scoring_func
+                                if use_grouped_topk:
+                                    kwargs |= grouped_topk_routing_kwargs
+                                if bias is not None:
+                                    kwargs["e_score_correction_bias"] = bias
                         else:
                             # External routing kwargs
                             kwargs |= dict(

@@ -573,6 +573,7 @@ steps:
   - csrc/quantization/w8a8/cutlass/moe/
   - csrc/moe/
   - tests/kernels/moe
+  - vllm/model_executor/hw_agnostic/layers/fused_moe/
   - vllm/model_executor/layers/fused_moe/
   - vllm/models/muse_spark/common/
   - vllm/models/muse_spark/nvidia/
@@ -593,6 +594,7 @@ steps:
       - csrc/quantization/w8a8/cutlass/moe/
       - csrc/moe/
       - tests/kernels/moe
+      - vllm/model_executor/hw_agnostic/layers/fused_moe/
       - vllm/model_executor/layers/fused_moe/
       - vllm/models/muse_spark/common/
       - vllm/models/muse_spark/nvidia/

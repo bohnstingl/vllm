@@ -16,7 +16,7 @@ from typing_extensions import TypeIs
 
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import GateLinear
+from vllm.model_executor import hw_agnostic
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.models.transformers.fx_utils import (
     find_node,
@@ -398,11 +398,12 @@ class MoEBlockFuser:
 
     def gate(
         self, moe_block: nn.Module, prefix: str, out_dtype: torch.dtype | None = None
-    ) -> GateLinear:
+    ) -> ReplicatedLinear:
         """Rebuild the HF gate as a `GateLinear` for vLLM's fused MoE."""
         hf_gate = getattr(moe_block, self.gate_name)
         num_experts, hidden_size = hf_gate.weight.shape
-        gate = GateLinear(
+        gate_cls = hw_agnostic.resolve("fused_moe.router.gate_linear", "GateLinear")
+        gate = gate_cls(
             hidden_size,
             num_experts,
             bias=False,
@@ -425,7 +426,8 @@ class MoEBlockFuser:
         gate = None
         if self.shared_gate_name is not None:
             hf_gate = getattr(moe_block, self.shared_gate_name)
-            gate = ReplicatedLinear(
+            linear_cls = hw_agnostic.resolve("linear", "ReplicatedLinear")
+            gate = linear_cls(
                 hf_gate.in_features,
                 hf_gate.out_features,
                 bias=hf_gate.bias is not None,
